@@ -1,4 +1,5 @@
-import argparse 
+import argparse
+
 
 def main(args):
 
@@ -15,10 +16,19 @@ def main(args):
 
 
 if __name__ == "__main__":
-    argparser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    argparser.add_argument("--output_path", type=str, help="Path to the output dictionary")
-    argparser.add_argument("--AA_list", type=str, default='', help="List of AAs to be biased")
-    argparser.add_argument("--bias_list", type=str, default='', help="AA bias strengths")
+    argparser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    argparser.add_argument("--output_path",
+                           type=str,
+                           help="Path to the output dictionary")
+    argparser.add_argument("--AA_list",
+                           type=str,
+                           default='',
+                           help="List of AAs to be biased")
+    argparser.add_argument("--bias_list",
+                           type=str,
+                           default='',
+                           help="AA bias strengths")
 
     args = argparser.parse_args()
     main(args)
