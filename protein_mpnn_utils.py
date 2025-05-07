@@ -46,6 +46,16 @@ def _scores(S, log_probs, mask):
     scores = torch.sum(loss * mask, dim=-1) / torch.sum(mask, dim=-1)
     return scores
 
+def _scores_w_loss(S, log_probs, mask):
+    """ Negative log probabilities """
+    criterion = torch.nn.NLLLoss(reduction='none')
+    loss = criterion(
+        log_probs.contiguous().view(-1,log_probs.size(-1)),
+        S.contiguous().view(-1)
+    ).view(S.size())
+    scores = torch.sum(loss * mask, dim=-1) / torch.sum(mask, dim=-1)
+    return scores, loss
+
 def _S_to_seq(S, mask):
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
     seq = ''.join([alphabet[c] for c, m in zip(S.tolist(), mask.tolist()) if m > 0])
@@ -135,6 +145,24 @@ def parse_PDB_biounits(x, atoms=['N','CA','C'], chain=None):
       return np.array(xyz_).reshape(-1,len(atoms),3), N_to_AA(np.array(seq_))
   except TypeError:
       return 'no_chain', 'no_chain'
+
+def get_pdb(pdb_code="", local_path=None):
+    """Fetch PDB file
+    
+    Args:
+        pdb_code (str): PDB code, if provided will download from RCSB PDB
+        local_path (str): Local PDB file path, if provided will use local file
+        
+    Returns:
+        str: Path to PDB file
+    """
+    if local_path and os.path.exists(local_path):
+        return local_path
+    elif pdb_code and pdb_code.strip():
+        os.system(f"wget -qnc https://files.rcsb.org/view/{pdb_code}.pdb")
+        return f"{pdb_code}.pdb"
+    else:
+        raise ValueError("Must provide either local PDB file path or valid PDB code")
 
 def parse_PDB(path_to_pdb, input_chain_list=None, ca_only=False):
     c=0
