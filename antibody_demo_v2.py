@@ -1,8 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-colab version: ./colab_notebooks/MPNN_quickdemo_score_antibody.ipynb
-"""
-
 import os, sys
 import argparse
 import re
@@ -29,17 +24,66 @@ from protein_mpnn_utils import (
     ProteinMPNN
 )
 
-#@markdown ### Input Options
-pdb = '6wgl'  #@param {type:"string"}
-# pdb_path = get_pdb(pdb)
-pdb_path = './inputs/Antibody/6wgl.pdb'
-#@markdown - pdb code (leave blank to get an upload prompt)
+custom_cdr_ranges = {}
 
-homomer = False  #@param {type:"boolean"}
-designed_chain = "C"  #@param {type:"string"}
-fixed_chain = "A B"  #@param {type:"string"}
+def parse_cdr_range(range_str):
+    """
+    Parse a string describing CDR ranges into a dictionary
+    
+    Format: "H:26-35,50-66,99-114;L:24-39,55-61,94-102"
+    
+    Args:
+        range_str: String in the format described above
+        
+    Returns:
+        Dictionary mapping chains to lists of (start, end) tuples
+    """
+    if not range_str:
+        return {}
+        
+    result = {}
+    chain_parts = range_str.split(';')
+    
+    for part in chain_parts:
+        if ':' not in part:
+            continue
+            
+        chain, ranges = part.split(':')
+        chain = chain.strip()
+        result[chain] = []
+        
+        for range_part in ranges.split(','):
+            if '-' in range_part:
+                start, end = map(int, range_part.split('-'))
+                result[chain].append((start, end))
+    
+    return result
 
-out_folder = f'./outputs/{pdb}/'
+parser = argparse.ArgumentParser(description='ProteinMPNN Antibody Demo with CDR Analysis')
+parser.add_argument('--pdb', type=str, default=None, help='PDB code')
+parser.add_argument('--pdb_path', type=str, default=None, help='Path to PDB file (overrides pdb code)')
+parser.add_argument('--designed_chain', type=str, default='C', help='Chains to design, comma separated')
+parser.add_argument('--fixed_chain', type=str, default='A B', help='Chains to keep fixed, comma separated')
+parser.add_argument('--cdr_ranges', type=str, default='', 
+                   help='Custom CDR ranges in format "H:26-35,50-66,99-114;L:24-39,55-61,94-102"')
+parser.add_argument('--out_folder', type=str, default=None, help='Output folder path')
+parser.add_argument('--homomer', action='store_true', help='Treat as homomer')
+
+args = parser.parse_args()
+if args.pdb_path:
+    pdb_path = args.pdb_path
+elif args.pdb:
+    pdb = args.pdb
+    pdb_path = get_pdb(pdb)
+designed_chain = args.designed_chain
+fixed_chain = args.fixed_chain
+homomer = args.homomer
+if args.out_folder:
+    out_folder = args.out_folder
+else:
+    out_folder = f'./outputs/temp/'
+custom_cdr_ranges = parse_cdr_range(args.cdr_ranges)
+
 os.makedirs(out_folder, exist_ok=True)
 
 device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
@@ -73,6 +117,24 @@ model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 print("Model loaded")
 
+def is_in_cdr_range(chain, position, custom_ranges=None):
+    """
+    Check if a position in a chain is within any CDR range
+    
+    Args:
+        chain: Chain identifier (e.g., 'H', 'L')
+        position: Residue position (1-indexed)
+        custom_ranges: User-provided dictionary mapping chains to lists of (start, end) tuples
+        
+    Returns:
+        bool: True if position is in any CDR range for the chain, False otherwise
+    """
+    if custom_ranges and chain in custom_ranges:
+        for start, end in custom_ranges[chain]:
+            if start <= position <= end:
+                return True
+    
+    return False
 
 #@title Helper functions
 def make_tied_positions_for_homomers(pdb_dict_list):
@@ -263,8 +325,8 @@ with torch.no_grad():
                                   decoding_order=sample_dict["decoding_order"])
                 mask_for_loss = mask * chain_M * chain_M_pos
                 scores, losses = _scores_w_loss(S_sample, log_probs, mask_for_loss)
-                print(scores)
-                print(losses)
+                # print(scores)
+                # print(losses)
                 scores = scores.cpu().data.numpy()
                 seq_loss = losses.cpu().data.numpy()
                 all_probs_list.append(sample_dict["probs"].cpu().data.numpy())
@@ -408,20 +470,102 @@ for b_ix in range(BATCH_COPIES):
             # Get scores for positions belonging to this chain
             chain_scores = seq_loss[b_ix, start_idx:end_idx]
 
-            # Print scores
-            print(f"Chain {designed_chain} position scores:")
+            # Print all scores for this chain
+            tprint(f"Chain {designed_chain} all position scores:")
             for pos, score in enumerate(chain_scores):
-                if mask_for_loss[b_ix, start_idx +
-                                 pos] > 0:  # Only print valid positions
-                    print(f"Position {pos+1}: {score:.4f}")
+                actual_pos = pos + 1  # Convert to 1-indexed position
+                if mask_for_loss[b_ix, start_idx + pos] > 0:
+                    print(f"Position {actual_pos}: {score:.4f}")
+            
+            # Print scores for CDR regions only
+            tprint(f"Chain {designed_chain} CDR position scores:")
+            cdr_positions = []
+            cdr_scores = []
+            
+            for pos, score in enumerate(chain_scores):
+                actual_pos = pos + 1  # Convert to 1-indexed position
+                if mask_for_loss[b_ix, start_idx + pos] > 0 and is_in_cdr_range(designed_chain, actual_pos, custom_cdr_ranges):
+                    print(f"CDR Position {actual_pos}: {score:.4f}")
+                    cdr_positions.append(actual_pos)
+                    cdr_scores.append(score)
+            
+            # print top 15% cdr scores
+            if len(cdr_scores) > 0:
+                # pair scores and positions and sort by score
+                score_pos_pairs = list(zip(cdr_scores, cdr_positions))
+                score_pos_pairs.sort(reverse=True)
+                
+                # calculate top 15% number
+                top_n = max(1, int(len(score_pos_pairs) * 0.15))
+                
+                tprint(f"Top {top_n} ({15:.0f}%) CDR positions with highest scores:")
+                top_positions = []
+                top_scores = []
+                for i in range(top_n):
+                    if i < len(score_pos_pairs):  # ensure not out of range
+                        score, pos = score_pos_pairs[i]
+                        print(f"CDR Position {pos}: {score:.4f} (rank {i+1})")
+                        top_positions.append(pos)
+                        top_scores.append(score)
+                
+                # save top 15% cdr scores to file
+                top_cdr_scores_output_file = os.path.join(
+                    out_folder,
+                    f"{name_}_chain_{designed_chain}_top15percent_cdr_scores.npy")
+                np.save(top_cdr_scores_output_file, np.array([top_positions, top_scores]))
+                print(
+                    f"Chain {designed_chain} top 15% CDR position scores saved to: {top_cdr_scores_output_file}"
+                )
+                
+                # create bar plot to visualize cdr scores
+                if len(cdr_positions) > 0:
+                    try:
+                        plt.figure(figsize=(12, 6))
+                        
+                        bars = plt.bar(range(len(cdr_positions)), cdr_scores, alpha=0.7)
+                        
+                        plt.xticks(range(len(cdr_positions)), cdr_positions, rotation=90)
+                        plt.xlabel('CDR Position')
+                        plt.ylabel('Score (negative log probability)')
+                        plt.title(f'Chain {designed_chain} CDR Position Scores')
+                        
+                        # highlight top 15% positions
+                        top_indices = [cdr_positions.index(pos) for pos in top_positions if pos in cdr_positions]
+                        for idx in top_indices:
+                            bars[idx].set_color('red')
+                            bars[idx].set_alpha(1.0)
+                        
+                        from matplotlib.patches import Patch
+                        legend_elements = [
+                            Patch(facecolor='red', alpha=1.0, label=f'Top {top_n} positions'),
+                            Patch(facecolor='blue', alpha=0.7, label='Other CDR positions')
+                        ]
+                        plt.legend(handles=legend_elements)
+                        
+                        plot_path = os.path.join(out_folder, f"{name_}_chain_{designed_chain}_cdr_scores.png")
+                        plt.tight_layout()
+                        plt.savefig(plot_path)
+                        plt.close()
+                        print(f"CDR scores plot saved to: {plot_path}")
+                    except Exception as e:
+                        print(f"Error creating plot: {str(e)}")
+            
+            # Save CDR scores to file
+            cdr_scores_output_file = os.path.join(
+                out_folder,
+                f"{name_}_chain_{designed_chain}_cdr_position_scores.npy")
+            np.save(cdr_scores_output_file, np.array([cdr_positions, cdr_scores]))
+            print(
+                f"Chain {designed_chain} CDR position scores saved to: {cdr_scores_output_file}"
+            )
 
-            # Save scores to file (using chain ID in filename)
+            # Also save all position scores
             chain_scores_output_file = os.path.join(
                 out_folder,
                 f"{name_}_chain_{designed_chain}_position_scores.npy")
             np.save(chain_scores_output_file, chain_scores)
             print(
-                f"Chain {designed_chain} position scores saved to: {chain_scores_output_file}"
+                f"Chain {designed_chain} all position scores saved to: {chain_scores_output_file}"
             )
 
 output_name = pdb_dict_list[0]['name']  # Get PDB name (e.g. '7CR5')
@@ -474,22 +618,3 @@ for designed_chain in designed_chain_list:
         np.savez(chain_scores_file, **chain_scores_dict)
         print(
             f"Chain {designed_chain} all scores saved to: {chain_scores_file}")
-
-# import numpy as np
-# import os
-
-# file_path = "./7CR5_chain_L_position_scores.npy"
-# if os.path.exists(file_path):
-#     # Load the scores from the .npy file
-#     position_scores = np.load(file_path)
-
-#     # Print the loaded scores
-#     print(f"Scores loaded from {file_path}:")
-#     print(position_scores)
-
-#     # Optionally, print position-wise scores more nicely
-#     print("\nPosition-wise scores:")
-#     for i, score in enumerate(position_scores):
-#         print(f"Position {i+1}: {score:.4f}")
-# else:
-#     print(f"Error: File not found at {file_path}")
