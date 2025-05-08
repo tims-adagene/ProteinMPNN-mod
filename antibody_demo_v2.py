@@ -23,6 +23,7 @@ from protein_mpnn_utils import (
     StructureDatasetPDB, 
     ProteinMPNN
 )
+from boring_utils.utils import cprint, tprint
 
 custom_cdr_ranges = {}
 
@@ -115,7 +116,7 @@ model = ProteinMPNN(num_letters=21,
 model.to(device)
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
-print("Model loaded")
+tprint("Model loaded")
 
 def is_in_cdr_range(chain, position, custom_ranges=None):
     """
@@ -240,7 +241,7 @@ else:
 
 #@title RUN
 with torch.no_grad():
-    print('Generating sequences...')
+    tprint('Generating sequences...')
     for ix, protein in enumerate(dataset_valid):
         score_list = []
         loss_list = []

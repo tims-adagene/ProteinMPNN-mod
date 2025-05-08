@@ -28,6 +28,7 @@ from protein_mpnn_utils import (
     StructureDatasetPDB, 
     ProteinMPNN
 )
+from boring_utils.utils import cprint, tprint
 
 #@markdown ### Input Options
 pdb = '6wgl'  #@param {type:"string"}

@@ -65,10 +65,11 @@ def _S_to_seq(S, mask):
 
 def parse_PDB_biounits(x, atoms=['N', 'CA', 'C'], chain=None):
     '''
-  input:  x = PDB filename
-          atoms = atoms to extract (optional)
-  output: (length, atoms, coords=(x,y,z)), sequence
-  '''
+    Used in parse_PDB
+    input:  x = PDB filename
+            atoms = atoms to extract (optional)
+    output: (length, atoms, coords=(x,y,z)), sequence
+    '''
 
     alpha_1 = list("ARNDCQEGHILKMFPSTWYV-")
     states = len(alpha_1)
@@ -117,8 +118,7 @@ def parse_PDB_biounits(x, atoms=['N', 'CA', 'C'], chain=None):
                 else:
                     resa, resn = "", int(resn) - 1
 
-
-#         resn = int(resn)
+                # resn = int(resn)
                 if resn < min_resn:
                     min_resn = resn
                 if resn > max_resn:
@@ -154,8 +154,10 @@ def parse_PDB_biounits(x, atoms=['N', 'CA', 'C'], chain=None):
             else:
                 for atom in atoms:
                     xyz_.append(np.full(3, np.nan))
-        return np.array(xyz_).reshape(-1, len(atoms),
-                                      3), N_to_AA(np.array(seq_))
+        return (
+            np.array(xyz_).reshape(-1, len(atoms), 3), 
+            N_to_AA(np.array(seq_))
+        )
     except TypeError:
         return 'no_chain', 'no_chain'
 
@@ -1154,14 +1156,25 @@ class ProteinFeatures(nn.Module):
 
     def _get_rbf(self, A, B, E_idx):
         D_A_B = torch.sqrt(
-            torch.sum((A[:, :, None, :] - B[:, None, :, :])**2, -1) +
-            1e-6)  #[B, L, L]
-        D_A_B_neighbors = gather_edges(D_A_B[:, :, :, None],
-                                       E_idx)[:, :, :, 0]  #[B,L,K]
+            torch.sum(
+                (A[:, :, None, :] - B[:, None, :, :]) ** 2, -1
+            ) + 1e-6)  #[B, L, L]
+        D_A_B_neighbors = gather_edges(
+                            D_A_B[:, :, :, None],
+                            E_idx
+                        )[:, :, :, 0]  #[B,L,K]
         RBF_A_B = self._rbf(D_A_B_neighbors)
         return RBF_A_B
 
     def forward(self, X, mask, residue_idx, chain_labels):
+        """
+        X: [B, L, 4, 3] : [batch, seq_len, atom type, xyz]
+        mask: [B, L] : [batch, seq_len]
+        residue_idx: [B, L] : [batch, seq_len]
+        chain_labels: [B, L] : [batch, seq_len]
+
+        checkout parse_PDB_biounits
+        """
         if self.augment_eps > 0:
             X = X + self.augment_eps * torch.randn_like(X)
 
