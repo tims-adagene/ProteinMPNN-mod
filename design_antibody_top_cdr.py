@@ -66,7 +66,7 @@ parser = argparse.ArgumentParser(description='ProteinMPNN Antibody Design for To
 parser.add_argument('--pdb_path', type=str, required=True, help='Path to PDB file')
 parser.add_argument('--designed_chain', type=str, required=True, help='Chain to design, e.g. H')
 parser.add_argument('--fixed_chain', type=str, default='', help='Chains to keep fixed, comma separated')
-parser.add_argument('--top_cdr_file', type=str, required=True, help='NPY file with top 15% CDR positions from antibody_demo_v2.py')
+parser.add_argument('--top_cdr_files', type=str, nargs='+', required=True, help='NPY files with top 15% CDR positions from antibody_demo_v2.py (one file per designed chain)')
 parser.add_argument('--out_folder', type=str, default='./outputs/design/', help='Output folder path')
 parser.add_argument('--num_seqs', type=int, default=10, help='Number of sequences to generate')
 parser.add_argument('--temperature', type=float, default=0.1, help='Sampling temperature')
@@ -109,11 +109,15 @@ fixed_chain_list = args.fixed_chain.split(',') if args.fixed_chain else []
 chain_list = list(set(designed_chain_list + fixed_chain_list))
 pdb_dict_list = parse_PDB(args.pdb_path, input_chain_list=chain_list)
 
-# Load top 15% CDR positions
-top_cdr_data = np.load(args.top_cdr_file)
-top_positions = top_cdr_data[0].astype(int)
-tprint(f"Loaded {len(top_positions)} top CDR positions:")
-cprint(top_positions)
+# Load top 15% CDR positions for each chain
+top_positions_dict = {}
+for i, top_cdr_file in enumerate(args.top_cdr_files):
+    if i < len(designed_chain_list):
+        chain = designed_chain_list[i]
+        top_cdr_data = np.load(top_cdr_file)
+        top_positions_dict[chain] = top_cdr_data[0].astype(int)
+        print(f"Loaded {len(top_positions_dict[chain])} top CDR positions for chain {chain}:")
+        cprint(top_positions_dict[chain])
 
 # Create fixed_positions dictionary
 fixed_positions_dict = {}
@@ -127,13 +131,15 @@ for chain in designed_chain_list:
     
     # Create list of fixed positions (all positions except top CDR positions)
     fixed_pos = []
+    chain_top_positions = top_positions_dict.get(chain, [])
+    
     for pos in range(1, chain_length + 1):  # PDB positions start at 1
-        if pos not in top_positions:
+        if pos not in chain_top_positions:
             fixed_pos.append(pos)
     
     fixed_positions_dict[pdb_name][chain] = fixed_pos
-
-tprint(f"Created fixed positions dictionary, fixed {len(fixed_pos)} positions out of {chain_length}")
+    
+    print(f"Created fixed positions dictionary for chain {chain}, fixed {len(fixed_pos)} positions (out of {chain_length} total positions)")
 
 # Prepare chain_id_dict
 chain_id_dict = {}
@@ -305,7 +311,7 @@ with torch.no_grad():
                         # If this is a designed chain, highlight changes
                         if chain in designed_chain_list and chain in original_sequences:
                             orig_chain_seq = original_sequences[chain]
-                            highlighted_chain_seq = highlight_changes(orig_chain_seq, chain_seq)[1]  # 取设计序列
+                            highlighted_chain_seq = highlight_changes(orig_chain_seq, chain_seq)[1]
                             highlighted_seq += highlighted_chain_seq
                         else:
                             highlighted_seq += chain_seq
@@ -324,9 +330,21 @@ with torch.no_grad():
                     
                     f.write(f'>T={temperature}, sample={sample_number}, score={score_print}, seq_recovery={seq_rec_print}\n{formatted_seq}\n')
                     
-                    plain_orig_seq = formatted_native_seq.replace('/', '')
-                    plain_new_seq = formatted_seq.replace('/', '')
-                    highlighted_orig, highlighted_new = highlight_changes(plain_orig_seq, plain_new_seq)
+                    # Process each chain separately while preserving the separator
+                    orig_chains = formatted_native_seq.split('/')
+                    new_chains = formatted_seq.split('/')
+                    highlighted_chains_orig = []
+                    highlighted_chains_new = []
+                    
+                    for i, (orig_chain, new_chain) in enumerate(zip(orig_chains, new_chains)):
+                        # Apply highlighting to each chain individually
+                        h_orig, h_new = highlight_changes(orig_chain, new_chain)
+                        highlighted_chains_orig.append(h_orig)
+                        highlighted_chains_new.append(h_new)
+                    
+                    # Rejoin highlighted chains with separator '/'
+                    highlighted_orig = '/'.join(highlighted_chains_orig)
+                    highlighted_new = '/'.join(highlighted_chains_new)
                     
                     print(f"Sample {sample_number}:")
                     print(f"Original: {highlighted_orig}")
