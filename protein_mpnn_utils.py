@@ -13,6 +13,9 @@ import torch.nn.functional as F
 import random
 import itertools
 
+from boring_utils.utils import cprint, tprint
+from boring_utils.helpers import DEBUG, VERBOSE
+
 #A number of functions/classes are adopted from: https://github.com/jingraham/neurips19-graph-protein-design
 
 
@@ -63,12 +66,44 @@ def _S_to_seq(S, mask):
     return seq
 
 
+def get_pdb(pdb_code="", local_path=None):
+    """Fetch PDB file
+    
+    Args:
+        pdb_code (str): PDB code, if provided will download from RCSB PDB
+        local_path (str): Local PDB file path, if provided will use local file
+        
+    Returns:
+        str: Path to PDB file
+    """
+    if local_path and os.path.exists(local_path):
+        return local_path
+    elif pdb_code and pdb_code.strip():
+        os.system(f"wget -qnc https://files.rcsb.org/view/{pdb_code}.pdb")
+        return f"{pdb_code}.pdb"
+    else:
+        raise ValueError(
+            "Must provide either local PDB file path or valid PDB code")
+
+
 def parse_PDB_biounits(x, atoms=['N', 'CA', 'C'], chain=None):
     '''
     Used in parse_PDB
     input:  x = PDB filename
             atoms = atoms to extract (optional)
     output: (length, atoms, coords=(x,y,z)), sequence
+
+    ch: chain ID
+    atom: atom type
+    resi: residue index
+    resn: residue name
+    resa: residue insertion code
+    x, y, z: coordinates
+
+    xyz is a nested dictionary: xyz[residue_number][insertion_code][atom_name] = coordinates
+    seq is a nested dictionary: seq[residue_number][insertion_code] = three_letter_code
+
+    return shape: (length, atoms, coords=(x,y,z)), sequence
     '''
 
     alpha_1 = list("ARNDCQEGHILKMFPSTWYV-")
@@ -162,26 +197,6 @@ def parse_PDB_biounits(x, atoms=['N', 'CA', 'C'], chain=None):
         return 'no_chain', 'no_chain'
 
 
-def get_pdb(pdb_code="", local_path=None):
-    """Fetch PDB file
-    
-    Args:
-        pdb_code (str): PDB code, if provided will download from RCSB PDB
-        local_path (str): Local PDB file path, if provided will use local file
-        
-    Returns:
-        str: Path to PDB file
-    """
-    if local_path and os.path.exists(local_path):
-        return local_path
-    elif pdb_code and pdb_code.strip():
-        os.system(f"wget -qnc https://files.rcsb.org/view/{pdb_code}.pdb")
-        return f"{pdb_code}.pdb"
-    else:
-        raise ValueError(
-            "Must provide either local PDB file path or valid PDB code")
-
-
 def parse_PDB(path_to_pdb, input_chain_list=None, ca_only=False):
     c = 0
     pdb_dict_list = []
@@ -202,17 +217,18 @@ def parse_PDB(path_to_pdb, input_chain_list=None, ca_only=False):
         my_dict = {}
         s = 0
         concat_seq = ''
-        concat_N = []
-        concat_CA = []
-        concat_C = []
-        concat_O = []
-        concat_mask = []
-        coords_dict = {}
+        # concat_N = []
+        # concat_CA = []
+        # concat_C = []
+        # concat_O = []
+        # concat_mask = []
+        # coords_dict = {}
         for letter in chain_alphabet:
             if ca_only:
                 sidechain_atoms = ['CA']
             else:
                 sidechain_atoms = ['N', 'CA', 'C', 'O']
+
             xyz, seq = parse_PDB_biounits(biounit,
                                           atoms=sidechain_atoms,
                                           chain=letter)
@@ -252,12 +268,33 @@ def tied_featurize(batch,
                    pssm_dict=None,
                    bias_by_res_dict=None,
                    ca_only=False):
-    """ Pack and pad batch into torch tensors """
+    """
+    NOTE: Pack and pad batch into torch tensors, there's no real "featurize" here
+
+    batch: contains protein structure data
+    chain_dict: specifies which chains need to be predicted (masked chains) and which are used as conditions (visible chains)
+    fixed_position_dict: (usually None, checkout make_fixed_positions_dict.py) specifies which positions of amino acids are fixed
+    omit_AA_dict: (usually None) specifies which positions are prohibited from certain amino acids
+    tied_positions_dict: specifies which positions need to maintain the same amino acid (structural constraint)
+    ```
+    if homomer:
+        tied_positions_dict = make_tied_positions_for_homomers(pdb_dict_list)
+    else:
+        tied_positions_dict = None
+    ```
+    pssm_dict: position-specific scoring matrix information, used to guide design
+    """
+    if DEBUG or VERBOSE: 
+        cprint(batch[0].keys())
+        cprint(chain_dict)
+
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
     B = len(batch)
     lengths = np.array([len(b['seq']) for b in batch],
                        dtype=np.int32)  #sum of chain seq lengths
     L_max = max([len(b['seq']) for b in batch])
+
+    # Step 1: Init X atom coordinates (B, L_max, ?, 3)
     if ca_only:
         X = np.zeros([B, L_max, 1, 3])
     else:
@@ -284,6 +321,8 @@ def tied_featurize(batch,
         dtype=np.int32)  #1.0 for the bits that need to be predicted
     S = np.zeros([B, L_max], dtype=np.int32)
     omit_AA_mask = np.zeros([B, L_max, len(alphabet)], dtype=np.int32)
+
+    # Step 2: Distinguish visible chains and masked chains
     # Build the batch
     letter_list_list = []
     visible_list_list = []
@@ -323,6 +362,8 @@ def tied_featurize(batch,
         bias_by_res_list = []
         l0 = 0
         l1 = 0
+
+        # Step 3: Build the batch
         for step, letter in enumerate(all_chains):
             if letter in visible_chains:
                 letter_list.append(letter)
@@ -404,6 +445,8 @@ def tied_featurize(batch,
                 l0 += chain_length
                 c += 1
                 fixed_position_mask = np.ones(chain_length)
+
+                # fixed position restraint
                 if fixed_position_dict != None:
                     fixed_pos_list = fixed_position_dict[b['name']][letter]
                     if fixed_pos_list:
@@ -440,6 +483,7 @@ def tied_featurize(batch,
                 else:
                     bias_by_res_list.append(np.zeros([chain_length, 21]))
 
+        # Step 4: Tied position restraint
         letter_list_np = np.array(letter_list)
         tied_pos_list_of_lists = []
         tied_beta = np.ones(L_max)
@@ -450,6 +494,11 @@ def tied_featurize(batch,
                     list(
                         itertools.chain(
                             *[list(item) for item in tied_pos_list])))
+
+                # NOTE:
+                # Enforce same/related amino acids at specified positions
+                # tied_beta: coefficient controlling association strength per position  
+                # Critical for designing symmetric or repetitive protein structures
                 for tied_item in tied_pos_list:
                     one_list = []
                     for k, v in tied_item.items():
@@ -468,6 +517,7 @@ def tied_featurize(batch,
                     tied_pos_list_of_lists.append(one_list)
         tied_pos_list_of_lists_list.append(tied_pos_list_of_lists)
 
+        # Step 5: Concatenate all chains
         x = np.concatenate(x_chain_list, 0)  #[L, 4, 3]
         all_sequence = "".join(chain_seq_list)
         m = np.concatenate(chain_mask_list,
@@ -573,6 +623,8 @@ def tied_featurize(batch,
                                                        device=device)
     residue_idx = torch.from_numpy(residue_idx).to(dtype=torch.long,
                                                    device=device)
+
+    # Step 6: Convert to torch tensors
     S = torch.from_numpy(S).to(dtype=torch.long, device=device)
     X = torch.from_numpy(X).to(dtype=torch.float32, device=device)
     mask = torch.from_numpy(mask).to(dtype=torch.float32, device=device)
@@ -587,7 +639,13 @@ def tied_featurize(batch,
         X_out = X[:, :, 0]
     else:
         X_out = X
-    return X_out, S, mask, lengths, chain_M, chain_encoding_all, letter_list_list, visible_list_list, masked_list_list, masked_chain_length_list_list, chain_M_pos, omit_AA_mask, residue_idx, dihedral_mask, tied_pos_list_of_lists_list, pssm_coef_all, pssm_bias_all, pssm_log_odds_all, bias_by_res_all, tied_beta
+    
+    if DEBUG:
+        cprint(X_out.shape)
+        cprint(S.shape)
+        cprint(chain_M.shape)
+
+    return (X_out, S, mask, lengths, chain_M, chain_encoding_all, letter_list_list, visible_list_list, masked_list_list, masked_chain_length_list_list, chain_M_pos, omit_AA_mask, residue_idx, dihedral_mask, tied_pos_list_of_lists_list, pssm_coef_all, pssm_bias_all, pssm_log_odds_all, bias_by_res_all, tied_beta)
 
 
 def loss_nll(S, log_probs, mask):
@@ -814,18 +872,24 @@ class EncLayer(nn.Module):
 
     def forward(self, h_V, h_E, E_idx, mask_V=None, mask_attend=None):
         """ Parallel computation of full transformer layer """
-
+        # Info aggregation and message passing
         h_EV = cat_neighbors_nodes(h_V, h_E, E_idx)
         h_V_expand = h_V.unsqueeze(-2).expand(-1, -1, h_EV.size(-2), -1)
         h_EV = torch.cat([h_V_expand, h_EV], -1)
         h_message = self.W3(self.act(self.W2(self.act(self.W1(h_EV)))))
+
+        # Mask filtering
         if mask_attend is not None:
             h_message = mask_attend.unsqueeze(-1) * h_message
+
         dh = torch.sum(h_message, -2) / self.scale
         h_V = self.norm1(h_V + self.dropout1(dh))
 
+        # Position-wise feedforward
         dh = self.dense(h_V)
         h_V = self.norm2(h_V + self.dropout2(dh))
+
+        # Mask filtering
         if mask_V is not None:
             mask_V = mask_V.unsqueeze(-1)
             h_V = mask_V * h_V
@@ -1413,6 +1477,8 @@ class ProteinMPNN(nn.Module):
         h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
         h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
         h_EXV_encoder_fw = mask_fw * h_EXV_encoder
+
+        # Sampling step
         for t_ in range(N_nodes):
             t = decoding_order[:, t_]  #[B]
             chain_mask_gathered = torch.gather(chain_mask, 1, t[:, None])  #[B]
@@ -1460,6 +1526,8 @@ class ProteinMPNN(nn.Module):
                                   constant_bias[None, :] / temperature +
                                   bias_by_res_gathered / temperature,
                                   dim=-1)
+                
+                # PSSM bias
                 if pssm_bias_flag:
                     pssm_coef_gathered = torch.gather(pssm_coef, 1,
                                                       t[:, None])[:, 0]
@@ -1533,10 +1601,12 @@ class ProteinMPNN(nn.Module):
                     tied_beta=None,
                     bias_by_res=None):
         device = X.device
+
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
         h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=device)
         h_E = self.W_e(E)
+
         # Encoder is unmasked self-attention
         mask_attend = gather_nodes(mask.unsqueeze(-1), E_idx).squeeze(-1)
         mask_attend = mask.unsqueeze(-1) * mask_attend
@@ -1565,6 +1635,7 @@ class ProteinMPNN(nn.Module):
                                           None,
                                       ].repeat(X.shape[0], 1)
 
+        # Generate mask
         mask_size = E_idx.shape[1]
         permutation_matrix_reverse = torch.nn.functional.one_hot(
             decoding_order, num_classes=mask_size).float()

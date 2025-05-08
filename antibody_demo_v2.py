@@ -1,6 +1,7 @@
 import os, sys
 import argparse
 import re
+from matplotlib.offsetbox import DEBUG
 import matplotlib.pyplot as plt
 import shutil
 import warnings
@@ -24,6 +25,7 @@ from protein_mpnn_utils import (
     ProteinMPNN
 )
 from boring_utils.utils import cprint, tprint
+from boring_utils.helpers import DEBUG, VERBOSE
 
 custom_cdr_ranges = {}
 
@@ -472,11 +474,12 @@ for b_ix in range(BATCH_COPIES):
             chain_scores = seq_loss[b_ix, start_idx:end_idx]
 
             # Print all scores for this chain
-            tprint(f"Chain {designed_chain} all position scores:")
-            for pos, score in enumerate(chain_scores):
-                actual_pos = pos + 1  # Convert to 1-indexed position
-                if mask_for_loss[b_ix, start_idx + pos] > 0:
-                    print(f"Position {actual_pos}: {score:.4f}")
+            if VERBOSE:
+                tprint(f"Chain {designed_chain} all position scores:")
+                for pos, score in enumerate(chain_scores):
+                    actual_pos = pos + 1  # Convert to 1-indexed position
+                    if mask_for_loss[b_ix, start_idx + pos] > 0:
+                        print(f"Position {actual_pos}: {score:.4f}")
             
             # Print scores for CDR regions only
             tprint(f"Chain {designed_chain} CDR position scores:")
@@ -571,6 +574,7 @@ for b_ix in range(BATCH_COPIES):
 
 output_name = pdb_dict_list[0]['name']  # Get PDB name (e.g. '7CR5')
 
+tprint("Saving probabilities...")
 # Save probabilities
 probs_output_file = os.path.join(out_folder, f"{output_name}_probs.npy")
 np.save(probs_output_file, all_probs_concat)
