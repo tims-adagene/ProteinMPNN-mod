@@ -1,8 +1,59 @@
+"""
+ProteinMPNN Run Script
+
+Main execution script for running ProteinMPNN protein sequence design.
+This script handles model loading, data preparation, and sequence generation
+for protein backbone structures.
+
+Key Features:
+- Supports both PDB files and JSONL format inputs
+- Flexible chain design specification (which chains to redesign)
+- Multiple sampling modes: design, scoring, conditional/unconditional probabilities
+- PSSM (Position-Specific Scoring Matrix) integration
+- Position-specific constraints and biases
+- Tied position support for symmetric designs
+
+Main Components:
+- Model initialization and checkpoint loading
+- Data preprocessing and featurization
+- Sequence sampling with various constraints
+- Score calculation for backbone-sequence pairs
+- Output generation in FASTA format
+
+Usage:
+    python protein_mpnn_run.py --pdb_path <path> --out_folder <output_dir>
+
+For more details, see command-line arguments defined at the bottom of this file.
+"""
+
 import argparse
 import os.path
 
 
 def main(args):
+    """
+    Main execution function for ProteinMPNN sequence design.
+
+    This function orchestrates the entire protein design workflow including:
+    1. Environment setup (random seeds, device configuration)
+    2. Model and checkpoint loading
+    3. Input data loading (PDB or JSONL)
+    4. Processing design constraints from JSON files
+    5. Running inference (design, scoring, or probability calculation)
+    6. Saving results to output files
+
+    Args:
+        args: Parsed command-line arguments containing:
+            - Input paths (pdb_path or jsonl_path)
+            - Model configuration (model_name, path_to_model_weights)
+            - Design parameters (chains, fixed positions, sampling temperature)
+            - Output settings (out_folder, save_score, save_probs)
+            - Constraint files (PSSM, bias, omit_AA, tied_positions, etc.)
+            - Execution modes (score_only, conditional_probs_only, etc.)
+
+    Returns:
+        None. Results are written to files in the specified output folder.
+    """
 
     import json, time, os, sys, glob
     import shutil
@@ -22,6 +73,8 @@ def main(args):
     from protein_mpnn_utils import loss_nll, loss_smoothed, gather_edges, gather_nodes, gather_nodes_t, cat_neighbors_nodes, _scores, _S_to_seq, tied_featurize, parse_PDB, parse_fasta
     from protein_mpnn_utils import StructureDataset, StructureDatasetPDB, ProteinMPNN
 
+    # Set random seed for reproducibility
+    # If no seed is provided, generate a random one
     if args.seed:
         seed = args.seed
     else:
@@ -31,14 +84,19 @@ def main(args):
     random.seed(seed)
     np.random.seed(seed)
 
+    # Model architecture hyperparameters
+    # These are fixed for the pretrained ProteinMPNN models
     hidden_dim = 128
     num_layers = 3
 
+    # Determine model weights folder path
+    # Three model types available: vanilla, CA-only, and soluble
     if args.path_to_model_weights:
         model_folder_path = args.path_to_model_weights
         if model_folder_path[-1] != '/':
             model_folder_path = model_folder_path + '/'
     else:
+        # Use default model weights in the same directory as this script
         file_path = os.path.realpath(__file__)
         k = file_path.rfind("/")
         if args.ca_only:
@@ -57,16 +115,31 @@ def main(args):
     checkpoint_path = model_folder_path + f'{args.model_name}.pt'
     folder_for_outputs = args.out_folder
 
+    # Calculate batch parameters for parallel sequence generation
     NUM_BATCHES = args.num_seq_per_target // args.batch_size
     BATCH_COPIES = args.batch_size
+
+    # Parse temperature values for sampling
+    # Higher temperature = more diverse sequences, lower = more conservative
     temperatures = [float(item) for item in args.sampling_temp.split()]
+
+    # Setup amino acid alphabet and omission masks
+    # 'X' represents unknown/any amino acid (used as padding/mask token)
     omit_AAs_list = args.omit_AAs
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
     alphabet_dict = dict(zip(alphabet, range(21)))
     print_all = args.suppress_print == 0
+
+    # Create binary mask for amino acids to omit from design (1 = omit, 0 = allow)
     omit_AAs_np = np.array([AA in omit_AAs_list
                             for AA in alphabet]).astype(np.float32)
+
+    # Setup device (GPU if available, otherwise CPU)
     device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
+
+    # Load chain ID dictionary (specifies which chains to design vs. keep fixed)
+    # Format: {pdb_name: ([designed_chains], [fixed_chains])}
+    # Example: {"1ABC": (["A", "B"], ["C"])} means design chains A,B and keep C fixed
     if os.path.isfile(args.chain_id_jsonl):
         with open(args.chain_id_jsonl, 'r') as json_file:
             json_list = list(json_file)
@@ -78,6 +151,9 @@ def main(args):
             print(40 * '-')
             print('chain_id_jsonl is NOT loaded')
 
+    # Load fixed positions dictionary (specifies which residue positions to keep unchanged)
+    # Format: {pdb_name: {chain: [position_indices]}}
+    # Example: {"1ABC": {"A": [1, 5, 10]}} means keep positions 1,5,10 of chain A fixed
     if os.path.isfile(args.fixed_positions_jsonl):
         with open(args.fixed_positions_jsonl, 'r') as json_file:
             json_list = list(json_file)
@@ -89,6 +165,9 @@ def main(args):
             print('fixed_positions_jsonl is NOT loaded')
         fixed_positions_dict = None
 
+    # Load PSSM (Position-Specific Scoring Matrix) dictionary
+    # Used to bias the model toward certain amino acids at specific positions
+    # Useful for incorporating evolutionary information or sequence preferences
     if os.path.isfile(args.pssm_jsonl):
         with open(args.pssm_jsonl, 'r') as json_file:
             json_list = list(json_file)
@@ -101,6 +180,9 @@ def main(args):
             print('pssm_jsonl is NOT loaded')
         pssm_dict = None
 
+    # Load omit AA dictionary (specifies which amino acids to exclude at specific positions)
+    # Format: {pdb_name: {chain: [([positions], [amino_acids])]}}
+    # Example: {"1ABC": {"A": [([1,2,3], ["C", "M"])]}} means no Cys/Met at positions 1,2,3
     if os.path.isfile(args.omit_AA_jsonl):
         with open(args.omit_AA_jsonl, 'r') as json_file:
             json_list = list(json_file)
@@ -112,6 +194,10 @@ def main(args):
             print('omit_AA_jsonl is NOT loaded')
         omit_AA_dict = None
 
+    # Load amino acid bias dictionary (global bias for all positions)
+    # Format: {amino_acid: bias_value}
+    # Positive values make an AA more likely, negative values less likely
+    # Example: {"A": -1.0, "F": 0.5} reduces alanine and increases phenylalanine
     if os.path.isfile(args.bias_AA_jsonl):
         with open(args.bias_AA_jsonl, 'r') as json_file:
             json_list = list(json_file)
@@ -123,6 +209,9 @@ def main(args):
             print('bias_AA_jsonl is NOT loaded')
         bias_AA_dict = None
 
+    # Load tied positions dictionary (positions that must have the same amino acid)
+    # Critical for designing symmetric proteins or enforcing structural constraints
+    # Format: {pdb_name: [{chain1: [positions], chain2: [positions]}]}
     if os.path.isfile(args.tied_positions_jsonl):
         with open(args.tied_positions_jsonl, 'r') as json_file:
             json_list = list(json_file)
@@ -134,6 +223,8 @@ def main(args):
             print('tied_positions_jsonl is NOT loaded')
         tied_positions_dict = None
 
+    # Load position-specific bias dictionary (different from global bias_AA)
+    # Allows fine-grained control of amino acid preferences per residue position
     if os.path.isfile(args.bias_by_res_jsonl):
         with open(args.bias_by_res_jsonl, 'r') as json_file:
             json_list = list(json_file)
@@ -150,107 +241,140 @@ def main(args):
 
     if print_all:
         print(40 * '-')
+
+    # Convert bias_AA_dict to numpy array format for efficient processing
+    # This array aligns with the amino acid alphabet order
     bias_AAs_np = np.zeros(len(alphabet))
     if bias_AA_dict:
         for n, AA in enumerate(alphabet):
             if AA in list(bias_AA_dict.keys()):
                 bias_AAs_np[n] = bias_AA_dict[AA]
 
+    # Load input structure data (either single PDB file or JSONL dataset)
     if args.pdb_path:
+        # Parse single PDB file
         pdb_dict_list = parse_PDB(args.pdb_path, ca_only=args.ca_only)
         dataset_valid = StructureDatasetPDB(pdb_dict_list,
                                             truncate=None,
                                             max_length=args.max_length)
+
+        # Extract all chain IDs from the PDB structure
         all_chain_list = [
             item[-1:] for item in list(pdb_dict_list[0])
             if item[:9] == 'seq_chain'
-        ]  #['A','B', 'C',...]
+        ]  # Results in ['A','B', 'C',...]
+
+        # Determine which chains to design
         if args.pdb_path_chains:
             designed_chain_list = [
                 str(item) for item in args.pdb_path_chains.split()
             ]
         else:
+            # If not specified, design all chains
             designed_chain_list = all_chain_list
+
+        # Fixed chains are those not being designed (provide structural context)
         fixed_chain_list = [
             letter for letter in all_chain_list
             if letter not in designed_chain_list
         ]
+
+        # Create chain ID dictionary for this structure
         chain_id_dict = {}
         chain_id_dict[pdb_dict_list[0]['name']] = (designed_chain_list,
                                                    fixed_chain_list)
     else:
+        # Load from JSONL dataset (preprocessed structures)
         dataset_valid = StructureDataset(args.jsonl_path,
                                          truncate=None,
                                          max_length=args.max_length,
                                          verbose=print_all)
 
+    # Load pretrained model checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
     noise_level_print = checkpoint['noise_level']
+
+    # Initialize ProteinMPNN model with checkpoint parameters
+    # The model uses an encoder-decoder transformer architecture
     model = ProteinMPNN(ca_only=args.ca_only,
-                        num_letters=21,
+                        num_letters=21,  # 20 amino acids + 1 unknown/mask token
                         node_features=hidden_dim,
                         edge_features=hidden_dim,
                         hidden_dim=hidden_dim,
                         num_encoder_layers=num_layers,
                         num_decoder_layers=num_layers,
-                        augment_eps=args.backbone_noise,
-                        k_neighbors=checkpoint['num_edges'])
+                        augment_eps=args.backbone_noise,  # Gaussian noise for data augmentation
+                        k_neighbors=checkpoint['num_edges'])  # Number of edges in protein graph
     model.to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
+    model.eval()  # Set to evaluation mode (disables dropout, etc.)
 
     if print_all:
         print(40 * '-')
         print('Number of edges:', checkpoint['num_edges'])
         print(f'Training noise level: {noise_level_print}A')
 
-    # Build paths for experiment
+    # Create output directory structure
     base_folder = folder_for_outputs
     if base_folder[-1] != '/':
         base_folder = base_folder + '/'
     if not os.path.exists(base_folder):
         os.makedirs(base_folder)
 
+    # Create subdirectories for different output types
     if not os.path.exists(base_folder + 'seqs'):
-        os.makedirs(base_folder + 'seqs')
+        os.makedirs(base_folder + 'seqs')  # Generated sequences in FASTA format
 
     if args.save_score:
         if not os.path.exists(base_folder + 'scores'):
-            os.makedirs(base_folder + 'scores')
+            os.makedirs(base_folder + 'scores')  # Sequence scores
 
     if args.score_only:
         if not os.path.exists(base_folder + 'score_only'):
-            os.makedirs(base_folder + 'score_only')
+            os.makedirs(base_folder + 'score_only')  # Scoring mode output
 
     if args.conditional_probs_only:
         if not os.path.exists(base_folder + 'conditional_probs_only'):
-            os.makedirs(base_folder + 'conditional_probs_only')
+            os.makedirs(base_folder + 'conditional_probs_only')  # Conditional probabilities
 
     if args.unconditional_probs_only:
         if not os.path.exists(base_folder + 'unconditional_probs_only'):
-            os.makedirs(base_folder + 'unconditional_probs_only')
+            os.makedirs(base_folder + 'unconditional_probs_only')  # Unconditional probabilities
 
     if args.save_probs:
         if not os.path.exists(base_folder + 'probs'):
-            os.makedirs(base_folder + 'probs')
+            os.makedirs(base_folder + 'probs')  # Full probability distributions
 
-    # Timing
+    # Initialize timing and statistics
     start_time = time.time()
     total_residues = 0
     protein_list = []
     total_step = 0
-    # Validation epoch
+
+    # Main processing loop - iterate through all protein structures in the dataset
+    # No gradient computation needed (inference only)
     with torch.no_grad():
         test_sum, test_weights = 0., 0.
         for ix, protein in enumerate(dataset_valid):
+            # Initialize storage for this protein's results
             score_list = []
             global_score_list = []
             all_probs_list = []
             all_log_probs_list = []
             S_sample_list = []
+
+            # Create batch copies of the protein for parallel processing
             batch_clones = [
                 copy.deepcopy(protein) for i in range(BATCH_COPIES)
             ]
+
+            # Featurize the protein structure into model inputs
+            # This function converts PDB coordinates into graph representations with:
+            # - X: backbone atom coordinates
+            # - S: amino acid sequence (integer encoded)
+            # - mask: valid residue positions
+            # - chain_M: mask for positions to design (1) vs. keep fixed (0)
+            # - All the constraint information (PSSM, tied positions, etc.)
             X, S, mask, lengths, chain_M, chain_encoding_all, chain_list_list, visible_list_list, masked_list_list, masked_chain_length_list_list, chain_M_pos, omit_AA_mask, residue_idx, dihedral_mask, tied_pos_list_of_lists_list, pssm_coef, pssm_bias, pssm_log_odds_all, bias_by_res_all, tied_beta = tied_featurize(
                 batch_clones,
                 device,
@@ -261,41 +385,64 @@ def main(args):
                 pssm_dict,
                 bias_by_res_dict,
                 ca_only=args.ca_only)
+
+            # Create mask from PSSM log-odds threshold
+            # Positions with log-odds > threshold get mask value 1.0, otherwise 0.0
             pssm_log_odds_mask = (
                 pssm_log_odds_all
-                > args.pssm_threshold).float()  #1.0 for true, 0.0 for false
+                > args.pssm_threshold).float()
             name_ = batch_clones[0]['name']
+
+            # SCORING MODE: Calculate model score for existing sequence(s)
+            # Used to evaluate how well a sequence fits a backbone structure
             if args.score_only:
+                # Score the native PDB sequence and optionally additional FASTA sequences
                 loop_c = 0
                 if args.path_to_fasta:
+                    # Load additional sequences to score from FASTA file
                     fasta_names, fasta_seqs = parse_fasta(args.path_to_fasta,
                                                           omit=["/"])
                     loop_c = len(fasta_seqs)
+
+                # Loop through all sequences to score (PDB + FASTA sequences)
                 for fc in range(1 + loop_c):
                     if fc == 0:
+                        # Score the sequence from the PDB file
                         structure_sequence_score_file = base_folder + '/score_only/' + batch_clones[
                             0]['name'] + f'_pdb'
                     else:
+                        # Score sequences from the FASTA file
                         structure_sequence_score_file = base_folder + '/score_only/' + batch_clones[
                             0]['name'] + f'_fasta_{fc}'
                     native_score_list = []
                     global_native_score_list = []
+
                     if fc > 0:
+                        # Replace PDB sequence with FASTA sequence for scoring
                         input_seq_length = len(fasta_seqs[fc - 1])
                         S_input = torch.tensor(
                             [alphabet_dict[AA] for AA in fasta_seqs[fc - 1]],
                             device=device)[None, :].repeat(X.shape[0], 1)
-                        S[:, :
-                          input_seq_length] = S_input  #assumes that S and S_input are alphabetically sorted for masked_chains
+                        # Assumes S and S_input are alphabetically sorted for masked_chains
+                        S[:, :input_seq_length] = S_input
+
+                    # Calculate scores across multiple batches for statistics
                     for j in range(NUM_BATCHES):
+                        # Random noise for decoder (used in autoregressive sampling order)
                         randn_1 = torch.randn(chain_M.shape, device=X.device)
+
+                        # Forward pass through model to get log probabilities
                         log_probs = model(X, S, mask, chain_M * chain_M_pos,
                                           residue_idx, chain_encoding_all,
                                           randn_1)
+
+                        # Calculate score for designed positions only
                         mask_for_loss = mask * chain_M * chain_M_pos
                         scores = _scores(S, log_probs, mask_for_loss)
                         native_score = scores.cpu().data.numpy()
                         native_score_list.append(native_score)
+
+                        # Calculate global score (entire structure-sequence pair)
                         global_scores = _scores(S, log_probs, mask)
                         global_native_score = global_scores.cpu().data.numpy()
                         global_native_score_list.append(global_native_score)
@@ -338,6 +485,8 @@ def main(args):
                             print(
                                 f'Score for {name_}_{fc} from FASTA, mean: {ns_mean_print}, std: {ns_std_print}, sample size: {ns_sample_size},  global score, mean: {global_ns_mean_print}, std: {global_ns_std_print}, sample size: {ns_sample_size}'
                             )
+            # CONDITIONAL PROBABILITY MODE: Calculate p(AA_i | rest of sequence, backbone)
+            # Useful for analyzing sequence-structure compatibility and variant effects
             elif args.conditional_probs_only:
                 if print_all:
                     print(f'Calculating conditional probabilities for {name_}')
@@ -346,6 +495,8 @@ def main(args):
                 log_conditional_probs_list = []
                 for j in range(NUM_BATCHES):
                     randn_1 = torch.randn(chain_M.shape, device=X.device)
+                    # Calculate probability of each amino acid at each position
+                    # conditioned on the rest of the sequence and/or backbone
                     log_conditional_probs = model.conditional_probs(
                         X, S, mask, chain_M * chain_M_pos, residue_idx,
                         chain_encoding_all, randn_1,
@@ -353,19 +504,16 @@ def main(args):
                     log_conditional_probs_list.append(
                         log_conditional_probs.cpu().numpy())
                 concat_log_p = np.concatenate(log_conditional_probs_list,
-                                              0)  #[B, L, 21]
-                mask_out = (chain_M * chain_M_pos * mask)[
-                    0,
-                ].cpu().numpy()
+                                              0)  # [B, L, 21]
+                mask_out = (chain_M * chain_M_pos * mask)[0,].cpu().numpy()
                 np.savez(conditional_probs_only_file,
                          log_p=concat_log_p,
-                         S=S[
-                             0,
-                         ].cpu().numpy(),
-                         mask=mask[
-                             0,
-                         ].cpu().numpy(),
+                         S=S[0,].cpu().numpy(),
+                         mask=mask[0,].cpu().numpy(),
                          design_mask=mask_out)
+
+            # UNCONDITIONAL PROBABILITY MODE: Calculate p(AA_i | backbone only)
+            # Probability based solely on backbone structure, no sequence information
             elif args.unconditional_probs_only:
                 if print_all:
                     print(
@@ -375,52 +523,58 @@ def main(args):
                     0]['name']
                 log_unconditional_probs_list = []
                 for j in range(NUM_BATCHES):
+                    # Calculate amino acid probabilities from backbone alone
+                    # No sequence context used - pure structure-based prediction
                     log_unconditional_probs = model.unconditional_probs(
                         X, mask, residue_idx, chain_encoding_all)
                     log_unconditional_probs_list.append(
                         log_unconditional_probs.cpu().numpy())
                 concat_log_p = np.concatenate(log_unconditional_probs_list,
-                                              0)  #[B, L, 21]
-                mask_out = (chain_M * chain_M_pos * mask)[
-                    0,
-                ].cpu().numpy()
+                                              0)  # [B, L, 21]
+                mask_out = (chain_M * chain_M_pos * mask)[0,].cpu().numpy()
                 np.savez(unconditional_probs_only_file,
                          log_p=concat_log_p,
-                         S=S[
-                             0,
-                         ].cpu().numpy(),
-                         mask=mask[
-                             0,
-                         ].cpu().numpy(),
+                         S=S[0,].cpu().numpy(),
+                         mask=mask[0,].cpu().numpy(),
                          design_mask=mask_out)
+
+            # SEQUENCE GENERATION MODE: Design new sequences for the backbone
+            # Main mode for protein sequence design
             else:
+                # Calculate score for the native/input sequence first
                 randn_1 = torch.randn(chain_M.shape, device=X.device)
                 log_probs = model(X, S, mask, chain_M * chain_M_pos,
                                   residue_idx, chain_encoding_all, randn_1)
                 mask_for_loss = mask * chain_M * chain_M_pos
-                scores = _scores(
-                    S, log_probs,
-                    mask_for_loss)  #score only the redesigned part
+
+                # Score only the redesigned part (positions being designed)
+                scores = _scores(S, log_probs, mask_for_loss)
                 native_score = scores.cpu().data.numpy()
-                global_scores = _scores(
-                    S, log_probs, mask)  #score the whole structure-sequence
+
+                # Score the whole structure-sequence (including fixed positions)
+                global_scores = _scores(S, log_probs, mask)
                 global_native_score = global_scores.cpu().data.numpy()
-                # Generate some sequences
-                ali_file = base_folder + '/seqs/' + batch_clones[0][
-                    'name'] + '.fa'
-                score_file = base_folder + '/scores/' + batch_clones[0][
-                    'name'] + '.npz'
-                probs_file = base_folder + '/probs/' + batch_clones[0][
-                    'name'] + '.npz'
+
+                # Setup output files for sequences, scores, and probabilities
+                ali_file = base_folder + '/seqs/' + batch_clones[0]['name'] + '.fa'
+                score_file = base_folder + '/scores/' + batch_clones[0]['name'] + '.npz'
+                probs_file = base_folder + '/probs/' + batch_clones[0]['name'] + '.npz'
+
                 if print_all:
                     print(f'Generating sequences for: {name_}')
                 t0 = time.time()
+
+                # Generate sequences and write to FASTA file
                 with open(ali_file, 'w') as f:
+                    # Loop through different temperature settings
                     for temp in temperatures:
                         for j in range(NUM_BATCHES):
-                            randn_2 = torch.randn(chain_M.shape,
-                                                  device=X.device)
+                            # Random noise for autoregressive decoding order
+                            randn_2 = torch.randn(chain_M.shape, device=X.device)
+
+                            # Use regular sampling or tied sampling based on constraints
                             if tied_positions_dict == None:
+                                # Standard sampling: each position sampled independently
                                 sample_dict = model.sample(
                                     X,
                                     randn_2,
@@ -444,6 +598,8 @@ def main(args):
                                     bias_by_res=bias_by_res_all)
                                 S_sample = sample_dict["S"]
                             else:
+                                # Tied sampling: enforces same amino acid at linked positions
+                                # Critical for symmetric proteins and homooligomers
                                 sample_dict = model.tied_sample(
                                     X,
                                     randn_2,
@@ -467,8 +623,10 @@ def main(args):
                                     tied_pos=tied_pos_list_of_lists_list[0],
                                     tied_beta=tied_beta,
                                     bias_by_res=bias_by_res_all)
-                                # Compute scores
                                 S_sample = sample_dict["S"]
+
+                            # Score the generated sequence using the model
+                            # Use the same decoding order as sampling for consistency
                             log_probs = model(
                                 X,
                                 S_sample,
@@ -479,25 +637,30 @@ def main(args):
                                 randn_2,
                                 use_input_decoding_order=True,
                                 decoding_order=sample_dict["decoding_order"])
+
+                            # Calculate scores for designed positions
                             mask_for_loss = mask * chain_M * chain_M_pos
-                            scores = _scores(S_sample, log_probs,
-                                             mask_for_loss)
+                            scores = _scores(S_sample, log_probs, mask_for_loss)
                             scores = scores.cpu().data.numpy()
 
-                            global_scores = _scores(
-                                S_sample, log_probs,
-                                mask)  #score the whole structure-sequence
+                            # Calculate global scores (entire sequence)
+                            global_scores = _scores(S_sample, log_probs, mask)
                             global_scores = global_scores.cpu().data.numpy()
 
+                            # Store probabilities and sequences
                             all_probs_list.append(
                                 sample_dict["probs"].cpu().data.numpy())
                             all_log_probs_list.append(
                                 log_probs.cpu().data.numpy())
                             S_sample_list.append(S_sample.cpu().data.numpy())
+
+                            # Process each sequence in the batch
                             for b_ix in range(BATCH_COPIES):
-                                masked_chain_length_list = masked_chain_length_list_list[
-                                    b_ix]
+                                masked_chain_length_list = masked_chain_length_list_list[b_ix]
                                 masked_list = masked_list_list[b_ix]
+
+                                # Calculate sequence recovery rate
+                                # (fraction of positions matching native sequence)
                                 seq_recovery_rate = torch.sum(
                                     torch.sum(torch.nn.functional.one_hot(
                                         S[b_ix], 21) * torch.nn.functional.
