@@ -1,3 +1,43 @@
+"""
+ProteinMPNN Utilities Module
+
+Core utilities and model classes for ProteinMPNN protein sequence design.
+This module contains all the fundamental building blocks for the ProteinMPNN model.
+
+Key Components:
+1. Data Processing Functions:
+   - parse_fasta: Parse FASTA sequence files
+   - parse_PDB: Parse PDB structure files
+   - tied_featurize: Convert protein structures to model inputs
+
+2. Dataset Classes:
+   - StructureDataset: Load protein structures from JSONL files
+   - StructureDatasetPDB: Load protein structures from PDB files
+   - StructureLoader: Batch loader for efficient processing
+
+3. Model Architecture:
+   - ProteinMPNN: Main sequence design model
+   - ProteinFeatures: Graph-based protein structure featurization
+   - CA_ProteinFeatures: CA-only structure featurization
+   - EncLayer: Encoder transformer layer
+   - DecLayer: Decoder transformer layer
+
+4. Helper Functions:
+   - gather_edges, gather_nodes: Graph convolution utilities
+   - _scores: Calculate sequence-structure compatibility scores
+   - loss_nll, loss_smoothed: Training loss functions
+
+Model Architecture:
+ProteinMPNN uses an encoder-decoder transformer architecture on protein graphs:
+- Encoder: Processes backbone structure with full self-attention
+- Decoder: Generates sequence autoregressively with masked self-attention
+- Graph representation: k-nearest neighbor graph based on Ca distances
+- Features: RBF-encoded distances, orientations, positional embeddings
+
+Note: Some functions/classes are adopted from:
+https://github.com/jingraham/neurips19-graph-protein-design
+"""
+
 from __future__ import print_function
 import json, time, os, sys, glob
 import shutil
@@ -16,10 +56,21 @@ import itertools
 from boring_utils.utils import cprint, tprint
 from boring_utils.helpers import DEBUG, VERBOSE
 
-#A number of functions/classes are adopted from: https://github.com/jingraham/neurips19-graph-protein-design
-
 
 def parse_fasta(filename, limit=-1, omit=[]):
+    """
+    Parse a FASTA file and extract sequences.
+
+    Args:
+        filename (str): Path to FASTA file
+        limit (int): Maximum number of sequences to read (-1 for all)
+        omit (list): List of characters to remove from sequences (e.g., ["/"])
+
+    Returns:
+        tuple: (headers, sequences) as numpy arrays
+            headers: Array of sequence names (without '>')
+            sequences: Array of amino acid sequences
+    """
     header = []
     sequence = []
     lines = open(filename, "r")
@@ -42,7 +93,18 @@ def parse_fasta(filename, limit=-1, omit=[]):
 
 
 def _scores(S, log_probs, mask):
-    """ Negative log probabilities """
+    """
+    Calculate average negative log probability (score) for a sequence.
+    Lower scores indicate better sequence-structure compatibility.
+
+    Args:
+        S (torch.Tensor): Amino acid sequence indices [B, L]
+        log_probs (torch.Tensor): Log probabilities from model [B, L, 21]
+        mask (torch.Tensor): Valid position mask [B, L] (1.0 for valid, 0.0 for padding)
+
+    Returns:
+        torch.Tensor: Average negative log probability per sequence [B]
+    """
     criterion = torch.nn.NLLLoss(reduction='none')
     loss = criterion(log_probs.contiguous().view(-1, log_probs.size(-1)),
                      S.contiguous().view(-1)).view(S.size())
@@ -51,7 +113,19 @@ def _scores(S, log_probs, mask):
 
 
 def _scores_w_loss(S, log_probs, mask):
-    """ Negative log probabilities """
+    """
+    Calculate scores and per-position losses.
+
+    Args:
+        S (torch.Tensor): Amino acid sequence indices [B, L]
+        log_probs (torch.Tensor): Log probabilities from model [B, L, 21]
+        mask (torch.Tensor): Valid position mask [B, L]
+
+    Returns:
+        tuple: (scores, loss)
+            scores: Average negative log probability [B]
+            loss: Per-position negative log probability [B, L]
+    """
     criterion = torch.nn.NLLLoss(reduction='none')
     loss = criterion(log_probs.contiguous().view(-1, log_probs.size(-1)),
                      S.contiguous().view(-1)).view(S.size())
@@ -60,6 +134,16 @@ def _scores_w_loss(S, log_probs, mask):
 
 
 def _S_to_seq(S, mask):
+    """
+    Convert amino acid indices to sequence string.
+
+    Args:
+        S (torch.Tensor): Amino acid indices [L]
+        mask (torch.Tensor): Valid position mask [L]
+
+    Returns:
+        str: Amino acid sequence (only valid positions)
+    """
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
     seq = ''.join(
         [alphabet[c] for c, m in zip(S.tolist(), mask.tolist()) if m > 0])
@@ -87,24 +171,36 @@ def get_pdb(pdb_code="", local_path=None):
 
 
 def parse_PDB_biounits(x, atoms=['N', 'CA', 'C'], chain=None):
-    '''
-    Used in parse_PDB
-    input:  x = PDB filename
-            atoms = atoms to extract (optional)
-    output: (length, atoms, coords=(x,y,z)), sequence
+    """
+    Parse PDB file and extract backbone atom coordinates and sequence.
+    Used internally by parse_PDB function.
 
-    ch: chain ID
-    atom: atom type
-    resi: residue index
-    resn: residue name
-    resa: residue insertion code
-    x, y, z: coordinates
+    This function reads a PDB file and extracts coordinates for specified atoms
+    along with the amino acid sequence. It handles insertion codes and
+    converts MSE (selenomethionine) to MET.
 
-    xyz is a nested dictionary: xyz[residue_number][insertion_code][atom_name] = coordinates
-    seq is a nested dictionary: seq[residue_number][insertion_code] = three_letter_code
+    Args:
+        x (str): PDB filename/path
+        atoms (list): List of atom types to extract, default ['N', 'CA', 'C']
+        chain (str): Specific chain ID to parse, or None for first chain
 
-    return shape: (length, atoms, coords=(x,y,z)), sequence
-    '''
+    Returns:
+        tuple: (coordinates, sequence) or ('no_chain', 'no_chain') if parsing fails
+            coordinates: numpy array of shape [L, num_atoms, 3]
+            sequence: numpy array of single-letter amino acid codes
+
+    PDB file structure:
+        ch: chain ID
+        atom: atom type (N, CA, C, O, etc.)
+        resi: residue name (3-letter code)
+        resn: residue number
+        resa: residue insertion code (if any)
+        x, y, z: atom coordinates
+
+    Internal data structures:
+        xyz: nested dict xyz[residue_number][insertion_code][atom_name] = [x, y, z]
+        seq: nested dict seq[residue_number][insertion_code] = three_letter_code
+    """
 
     alpha_1 = list("ARNDCQEGHILKMFPSTWYV-")
     states = len(alpha_1)
@@ -198,8 +294,37 @@ def parse_PDB_biounits(x, atoms=['N', 'CA', 'C'], chain=None):
 
 
 def parse_PDB(path_to_pdb, input_chain_list=None, ca_only=False):
+    """
+    Parse PDB file and extract all chain structures into a dictionary format.
+
+    This is the main PDB parsing function that processes multi-chain protein
+    structures and organizes the data for use with ProteinMPNN.
+
+    Args:
+        path_to_pdb (str): Path to PDB file
+        input_chain_list (list): Specific chains to parse, or None for all chains
+        ca_only (bool): If True, only extract CA atoms; if False, extract N,CA,C,O
+
+    Returns:
+        list: List of dictionaries, each containing:
+            - 'name': PDB filename without extension
+            - 'num_of_chains': Number of chains parsed
+            - 'seq': Concatenated sequence of all chains
+            - 'seq_chain_X': Sequence for chain X
+            - 'coords_chain_X': Dictionary of coordinates for chain X
+                - If ca_only: {'CA_chain_X': [[x,y,z], ...]}
+                - Otherwise: {'N_chain_X': coords, 'CA_chain_X': coords,
+                             'C_chain_X': coords, 'O_chain_X': coords}
+
+    Chain naming:
+        Uses uppercase (A-Z), lowercase (a-z), then numbers (0-299)
+        to support up to 352 chains
+    """
     c = 0
     pdb_dict_list = []
+
+    # Create chain alphabet: A-Z, a-z, 0-299
+    # Supports up to 352 chains in a single structure
     init_alphabet = [
         'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
         'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b',
@@ -269,20 +394,52 @@ def tied_featurize(batch,
                    bias_by_res_dict=None,
                    ca_only=False):
     """
-    NOTE: Pack and pad batch into torch tensors, there's no real "featurize" here
+    Convert protein structures into model input tensors with constraints.
 
-    batch: contains protein structure data
-    chain_dict: specifies which chains need to be predicted (masked chains) and which are used as conditions (visible chains)
-    fixed_position_dict: (usually None, checkout make_fixed_positions_dict.py) specifies which positions of amino acids are fixed
-    omit_AA_dict: (usually None) specifies which positions are prohibited from certain amino acids
-    tied_positions_dict: specifies which positions need to maintain the same amino acid (structural constraint)
-    ```
-    if homomer:
-        tied_positions_dict = make_tied_positions_for_homomers(pdb_dict_list)
-    else:
-        tied_positions_dict = None
-    ```
-    pssm_dict: position-specific scoring matrix information, used to guide design
+    This is the core featurization function that processes protein structures
+    and prepares them for the ProteinMPNN model. It handles multi-chain proteins,
+    applies design constraints, and creates properly formatted tensors.
+
+    NOTE: Despite the name, this function primarily packs and pads data into
+    torch tensors rather than performing feature extraction (which happens in
+    the ProteinFeatures module).
+
+    Args:
+        batch (list): List of protein structure dictionaries from parse_PDB
+        device (torch.device): CUDA or CPU device
+        chain_dict (dict): Specifies which chains to design vs. keep fixed
+            Format: {pdb_name: ([designed_chains], [fixed_chains])}
+            Example: {"1ABC": (["A", "B"], ["C"])}
+        fixed_position_dict (dict): Positions to keep unchanged
+            Format: {pdb_name: {chain: [position_indices]}}
+        omit_AA_dict (dict): Amino acids to prohibit at specific positions
+            Format: {pdb_name: {chain: [([positions], [amino_acids])]}}
+        tied_positions_dict (dict): Positions that must have the same amino acid
+            Critical for symmetric proteins/homooligomers
+            Example for homomer: tied_positions_dict = make_tied_positions_for_homomers(pdb_dict_list)
+        pssm_dict (dict): Position-specific scoring matrices to guide design
+            Contains 'pssm_coef', 'pssm_bias', 'pssm_log_odds' per position
+        bias_by_res_dict (dict): Per-residue amino acid biases
+        ca_only (bool): If True, use CA-only coordinates
+
+    Returns:
+        tuple: (X, S, mask, lengths, chain_M, chain_encoding_all, ...)
+            X: Backbone coordinates [B, L, 4, 3] or [B, L, 3] if ca_only
+            S: Amino acid sequences (integer encoded) [B, L]
+            mask: Valid residue mask [B, L]
+            lengths: Sequence lengths per sample
+            chain_M: Design mask (1=design, 0=fixed) [B, L]
+            chain_encoding_all: Chain IDs [B, L]
+            ... (additional constraint and metadata tensors)
+
+    Processing steps:
+        1. Initialize coordinate and mask tensors
+        2. Separate visible (fixed) and masked (designable) chains
+        3. Build per-chain coordinates and masks
+        4. Apply fixed position constraints
+        5. Apply tied position constraints (for symmetry)
+        6. Concatenate chains and pad to maximum length
+        7. Convert to torch tensors on specified device
     """
     if DEBUG or VERBOSE: 
         cprint(batch[0].keys())
@@ -649,7 +806,21 @@ def tied_featurize(batch,
 
 
 def loss_nll(S, log_probs, mask):
-    """ Negative log probabilities """
+    """
+    Calculate negative log-likelihood loss for sequence design.
+
+    Standard cross-entropy loss used during ProteinMPNN training.
+
+    Args:
+        S (torch.Tensor): Ground truth amino acid indices [B, L]
+        log_probs (torch.Tensor): Predicted log probabilities [B, L, 21]
+        mask (torch.Tensor): Valid position mask [B, L]
+
+    Returns:
+        tuple: (loss, loss_av)
+            loss: Per-position negative log likelihood [B, L]
+            loss_av: Average loss across all valid positions (scalar)
+    """
     criterion = torch.nn.NLLLoss(reduction='none')
     loss = criterion(log_probs.contiguous().view(-1, log_probs.size(-1)),
                      S.contiguous().view(-1)).view(S.size())
@@ -658,10 +829,28 @@ def loss_nll(S, log_probs, mask):
 
 
 def loss_smoothed(S, log_probs, mask, weight=0.1):
-    """ Negative log probabilities """
+    """
+    Calculate label-smoothed cross-entropy loss.
+
+    Label smoothing prevents overconfidence and can improve generalization.
+    Instead of hard targets (one-hot), uses soft targets with small probability
+    mass distributed across all classes.
+
+    Args:
+        S (torch.Tensor): Ground truth amino acid indices [B, L]
+        log_probs (torch.Tensor): Predicted log probabilities [B, L, 21]
+        mask (torch.Tensor): Valid position mask [B, L]
+        weight (float): Smoothing weight (default 0.1)
+            Higher values = more smoothing
+
+    Returns:
+        tuple: (loss, loss_av)
+            loss: Per-position smoothed loss [B, L]
+            loss_av: Average loss across all valid positions (scalar)
+    """
     S_onehot = torch.nn.functional.one_hot(S, 21).float()
 
-    # Label smoothing
+    # Apply label smoothing: add small probability to all classes
     S_onehot = S_onehot + weight / float(S_onehot.size(-1))
     S_onehot = S_onehot / S_onehot.sum(-1, keepdim=True)
 
@@ -671,6 +860,24 @@ def loss_smoothed(S, log_probs, mask, weight=0.1):
 
 
 class StructureDataset():
+    """
+    Dataset for loading protein structures from JSONL files.
+
+    Each line in the JSONL file should be a JSON object containing:
+    - 'name': Protein name/identifier
+    - 'seq': Amino acid sequence
+    - 'coords': Dictionary of backbone atom coordinates per chain
+
+    Args:
+        jsonl_file (str): Path to JSONL file
+        verbose (bool): Print loading progress
+        truncate (int): Limit number of structures to load (None for all)
+        max_length (int): Maximum sequence length to include
+        alphabet (str): Valid amino acid characters
+
+    Attributes:
+        data (list): List of protein structure dictionaries
+    """
 
     def __init__(self,
                  jsonl_file,
@@ -729,6 +936,22 @@ class StructureDataset():
 
 
 class StructureDatasetPDB():
+    """
+    Dataset for loading protein structures from parsed PDB dictionaries.
+
+    Similar to StructureDataset but takes pre-parsed PDB dictionaries
+    instead of reading from JSONL files.
+
+    Args:
+        pdb_dict_list (list): List of dictionaries from parse_PDB()
+        verbose (bool): Print loading progress
+        truncate (int): Limit number of structures to load (None for all)
+        max_length (int): Maximum sequence length to include
+        alphabet (str): Valid amino acid characters
+
+    Attributes:
+        data (list): List of protein structure dictionaries
+    """
 
     def __init__(self,
                  pdb_dict_list,
@@ -771,6 +994,23 @@ class StructureDatasetPDB():
 
 
 class StructureLoader():
+    """
+    Custom data loader for protein structures with smart batching.
+
+    Clusters proteins by sequence length to minimize padding and maximize
+    GPU utilization. Unlike standard DataLoader, this creates batches where
+    total_sequence_length * num_proteins <= batch_size.
+
+    Args:
+        dataset: StructureDataset or StructureDatasetPDB instance
+        batch_size (int): Maximum total sequence length per batch
+        shuffle (bool): Shuffle batch order (not individual samples)
+        collate_fn: Function to collate batch (default: identity function)
+        drop_last (bool): Drop incomplete final batch
+
+    Attributes:
+        clusters (list): List of batches, each containing structure indices
+    """
 
     def __init__(self,
                  dataset,
@@ -809,16 +1049,46 @@ class StructureLoader():
             yield batch
 
 
-# The following gather functions
+# Graph neural network utility functions
 def gather_edges(edges, neighbor_idx):
-    # Features [B,N,N,C] at Neighbor indices [B,N,K] => Neighbor features [B,N,K,C]
+    """
+    Gather edge features for neighboring nodes.
+
+    Used in graph convolutions to collect edge features connecting to neighbors.
+
+    Args:
+        edges (torch.Tensor): Edge features [B, N, N, C]
+            Full pairwise edge feature matrix
+        neighbor_idx (torch.Tensor): Neighbor indices [B, N, K]
+            K nearest neighbors for each node
+
+    Returns:
+        torch.Tensor: Neighbor edge features [B, N, K, C]
+    """
     neighbors = neighbor_idx.unsqueeze(-1).expand(-1, -1, -1, edges.size(-1))
     edge_features = torch.gather(edges, 2, neighbors)
     return edge_features
 
 
 def gather_nodes(nodes, neighbor_idx):
-    # Features [B,N,C] at Neighbor indices [B,N,K] => [B,N,K,C]
+    """
+    Gather node features for neighboring nodes.
+
+    Collects features from K nearest neighbors for each node.
+    Essential for message passing in graph neural networks.
+
+    Args:
+        nodes (torch.Tensor): Node features [B, N, C]
+        neighbor_idx (torch.Tensor): Neighbor indices [B, N, K]
+
+    Returns:
+        torch.Tensor: Neighbor node features [B, N, K, C]
+
+    Implementation:
+        1. Flatten neighbor indices: [B, N, K] -> [B, N*K]
+        2. Gather features: [B, N, C] -> [B, N*K, C]
+        3. Reshape: [B, N*K, C] -> [B, N, K, C]
+    """
     # Flatten and expand indices per batch [B,N,K] => [B,NK] => [B,NK,C]
     neighbors_flat = neighbor_idx.view((neighbor_idx.shape[0], -1))
     neighbors_flat = neighbors_flat.unsqueeze(-1).expand(-1, -1, nodes.size(2))
@@ -830,19 +1100,63 @@ def gather_nodes(nodes, neighbor_idx):
 
 
 def gather_nodes_t(nodes, neighbor_idx):
-    # Features [B,N,C] at Neighbor index [B,K] => Neighbor features[B,K,C]
+    """
+    Gather node features at specific indices (time-step version).
+
+    Similar to gather_nodes but for selecting specific nodes rather than
+    neighborhoods. Used during autoregressive sequence generation.
+
+    Args:
+        nodes (torch.Tensor): Node features [B, N, C]
+        neighbor_idx (torch.Tensor): Node indices [B, K]
+
+    Returns:
+        torch.Tensor: Selected node features [B, K, C]
+    """
     idx_flat = neighbor_idx.unsqueeze(-1).expand(-1, -1, nodes.size(2))
     neighbor_features = torch.gather(nodes, 1, idx_flat)
     return neighbor_features
 
 
 def cat_neighbors_nodes(h_nodes, h_neighbors, E_idx):
+    """
+    Concatenate node features with their neighbors' features.
+
+    Combines central node and neighbor information for message passing.
+
+    Args:
+        h_nodes (torch.Tensor): Node features [B, N, C]
+        h_neighbors (torch.Tensor): Edge/neighbor features [B, N, K, C']
+        E_idx (torch.Tensor): Neighbor indices [B, N, K]
+
+    Returns:
+        torch.Tensor: Concatenated features [B, N, K, C+C']
+    """
     h_nodes = gather_nodes(h_nodes, E_idx)
     h_nn = torch.cat([h_neighbors, h_nodes], -1)
     return h_nn
 
 
 class EncLayer(nn.Module):
+    """
+    Encoder layer for ProteinMPNN.
+
+    Performs message passing on the protein graph with full self-attention.
+    Updates both node (residue) and edge (pairwise) features through
+    geometric attention mechanism.
+
+    Architecture:
+        1. Node update: Aggregate messages from neighbors
+        2. Feed-forward network on nodes
+        3. Edge update: Update pairwise features
+
+    Args:
+        num_hidden (int): Hidden dimension size
+        num_in (int): Input feature dimension
+        dropout (float): Dropout probability
+        num_heads: Not used (kept for compatibility)
+        scale (int): Normalization scale for aggregation (default 30)
+    """
 
     def __init__(self,
                  num_hidden,
@@ -871,7 +1185,19 @@ class EncLayer(nn.Module):
         self.dense = PositionWiseFeedForward(num_hidden, num_hidden * 4)
 
     def forward(self, h_V, h_E, E_idx, mask_V=None, mask_attend=None):
-        """ Parallel computation of full transformer layer """
+        """
+        Forward pass: update node and edge features through message passing.
+
+        Args:
+            h_V (torch.Tensor): Node features [B, N, C]
+            h_E (torch.Tensor): Edge features [B, N, K, C]
+            E_idx (torch.Tensor): Neighbor indices [B, N, K]
+            mask_V (torch.Tensor): Node mask [B, N]
+            mask_attend (torch.Tensor): Attention mask [B, N, K]
+
+        Returns:
+            tuple: (h_V, h_E) updated node and edge features
+        """
         # Info aggregation and message passing
         h_EV = cat_neighbors_nodes(h_V, h_E, E_idx)
         h_V_expand = h_V.unsqueeze(-2).expand(-1, -1, h_EV.size(-2), -1)
@@ -903,6 +1229,23 @@ class EncLayer(nn.Module):
 
 
 class DecLayer(nn.Module):
+    """
+    Decoder layer for ProteinMPNN.
+
+    Performs autoregressive sequence generation with masked self-attention.
+    Only allows attention to previously generated positions and encoder output.
+
+    Architecture:
+        1. Masked message passing (only attend to "past" positions)
+        2. Feed-forward network on nodes
+
+    Args:
+        num_hidden (int): Hidden dimension size
+        num_in (int): Input feature dimension
+        dropout (float): Dropout probability
+        num_heads: Not used (kept for compatibility)
+        scale (int): Normalization scale for aggregation (default 30)
+    """
 
     def __init__(self,
                  num_hidden,
@@ -926,7 +1269,19 @@ class DecLayer(nn.Module):
         self.dense = PositionWiseFeedForward(num_hidden, num_hidden * 4)
 
     def forward(self, h_V, h_E, mask_V=None, mask_attend=None):
-        """ Parallel computation of full transformer layer """
+        """
+        Forward pass: update node features with masked attention.
+
+        Args:
+            h_V (torch.Tensor): Node features [B, N, C]
+            h_E (torch.Tensor): Combined edge features [B, N, K, C]
+            mask_V (torch.Tensor): Node mask [B, N]
+            mask_attend (torch.Tensor): Attention mask [B, N, K]
+                Controls which positions can attend to which
+
+        Returns:
+            torch.Tensor: Updated node features [B, N, C]
+        """
 
         # Concatenate h_V_i to h_E_ij
         h_V_expand = h_V.unsqueeze(-2).expand(-1, -1, h_E.size(-2), -1)
@@ -950,6 +1305,16 @@ class DecLayer(nn.Module):
 
 
 class PositionWiseFeedForward(nn.Module):
+    """
+    Position-wise feed-forward network.
+
+    Two-layer MLP applied independently to each position.
+    Standard component of transformer architectures.
+
+    Args:
+        num_hidden (int): Input/output dimension
+        num_ff (int): Hidden layer dimension (usually 4x num_hidden)
+    """
 
     def __init__(self, num_hidden, num_ff):
         super(PositionWiseFeedForward, self).__init__()
@@ -958,12 +1323,24 @@ class PositionWiseFeedForward(nn.Module):
         self.act = torch.nn.GELU()
 
     def forward(self, h_V):
+        """Apply feed-forward network."""
         h = self.act(self.W_in(h_V))
         h = self.W_out(h)
         return h
 
 
 class PositionalEncodings(nn.Module):
+    """
+    Relative positional encodings for protein sequences.
+
+    Encodes relative position between residues along the sequence.
+    Uses learnable embeddings for position differences within a window.
+
+    Args:
+        num_embeddings (int): Embedding dimension
+        max_relative_feature (int): Maximum relative distance to encode
+            Positions beyond this use a special token
+    """
 
     def __init__(self, num_embeddings, max_relative_feature=32):
         super(PositionalEncodings, self).__init__()
@@ -983,6 +1360,26 @@ class PositionalEncodings(nn.Module):
 
 
 class CA_ProteinFeatures(nn.Module):
+    """
+    Extract graph features from CA-only protein structures.
+
+    Simplified version of ProteinFeatures that only uses CA (alpha carbon) atoms.
+    Useful for low-resolution structures or when full backbone is unavailable.
+
+    Creates k-nearest neighbor graph based on CA-CA distances and encodes:
+    - Distance features using radial basis functions (RBF)
+    - Orientation features (backbone geometry)
+    - Positional encodings (sequence separation)
+
+    Args:
+        edge_features (int): Edge feature dimension
+        node_features (int): Node feature dimension (not used in CA-only)
+        num_positional_embeddings (int): Dimension for positional encodings
+        num_rbf (int): Number of RBF kernels for distance encoding
+        top_k (int): Number of nearest neighbors
+        augment_eps (float): Gaussian noise level for coordinate augmentation
+        num_chain_embeddings (int): Not used (kept for compatibility)
+    """
 
     def __init__(self,
                  edge_features,
@@ -992,7 +1389,6 @@ class CA_ProteinFeatures(nn.Module):
                  top_k=30,
                  augment_eps=0.,
                  num_chain_embeddings=16):
-        """ Extract protein features """
         super(CA_ProteinFeatures, self).__init__()
         self.edge_features = edge_features
         self.node_features = node_features
@@ -1172,6 +1568,28 @@ class CA_ProteinFeatures(nn.Module):
 
 
 class ProteinFeatures(nn.Module):
+    """
+    Extract graph features from full-backbone protein structures.
+
+    Full version using N, CA, C, O backbone atoms for richer geometric features.
+    Creates k-nearest neighbor graph and encodes detailed structural information.
+
+    Features computed:
+    - RBF-encoded distances for 25 atom pairs (all combinations of N,CA,C,O,Cb)
+    - Virtual Cb positions (computed geometrically from N,CA,C)
+    - Positional encodings (sequence separation)
+    - Chain encodings (intra vs. inter-chain interactions)
+
+    Args:
+        edge_features (int): Edge feature dimension
+        node_features (int): Node feature dimension (not used)
+        num_positional_embeddings (int): Dimension for positional encodings
+        num_rbf (int): Number of RBF kernels for distance encoding
+        top_k (int): Number of nearest neighbors in graph
+        augment_eps (float): Gaussian noise level for coordinate augmentation
+            Used during training for robustness
+        num_chain_embeddings (int): Not used (kept for compatibility)
+    """
 
     def __init__(self,
                  edge_features,
@@ -1181,7 +1599,6 @@ class ProteinFeatures(nn.Module):
                  top_k=30,
                  augment_eps=0.,
                  num_chain_embeddings=16):
-        """ Extract protein features """
         super(ProteinFeatures, self).__init__()
         self.edge_features = edge_features
         self.node_features = node_features
@@ -1296,6 +1713,48 @@ class ProteinFeatures(nn.Module):
 
 
 class ProteinMPNN(nn.Module):
+    """
+    ProteinMPNN: Structure-based protein sequence design model.
+
+    Encoder-decoder transformer architecture that designs amino acid sequences
+    for given protein backbone structures. Uses graph neural networks on
+    k-nearest neighbor graphs of protein residues.
+
+    Architecture Overview:
+    1. Feature Extraction: Convert backbone coordinates to graph features
+    2. Encoder: Process structure with full self-attention (3 layers)
+    3. Decoder: Generate sequence autoregressively with masked attention (3 layers)
+    4. Output: Per-position amino acid probability distributions
+
+    Key Capabilities:
+    - Fixed-backbone sequence design
+    - Multi-chain protein design
+    - Conditional design (keep some positions/chains fixed)
+    - Tied positions (for symmetric designs)
+    - PSSM-guided design
+    - Temperature-based diversity control
+
+    Args:
+        num_letters (int): Vocabulary size (21 for 20 AAs + unknown)
+        node_features (int): Node feature dimension
+        edge_features (int): Edge feature dimension
+        hidden_dim (int): Hidden dimension for transformer layers
+        num_encoder_layers (int): Number of encoder layers (default 3)
+        num_decoder_layers (int): Number of decoder layers (default 3)
+        vocab (int): Vocabulary size (same as num_letters)
+        k_neighbors (int): Number of nearest neighbors in graph (default 64)
+        augment_eps (float): Coordinate noise for augmentation (default 0.05)
+        dropout (float): Dropout probability (default 0.1)
+        ca_only (bool): Use CA-only features vs. full backbone
+
+    Attributes:
+        features: ProteinFeatures or CA_ProteinFeatures module
+        W_e: Edge embedding layer
+        W_s: Sequence embedding layer
+        encoder_layers: List of encoder transformer layers
+        decoder_layers: List of decoder transformer layers
+        W_out: Output projection to vocabulary
+    """
 
     def __init__(self,
                  num_letters,
@@ -1311,7 +1770,7 @@ class ProteinMPNN(nn.Module):
                  ca_only=False):
         super(ProteinMPNN, self).__init__()
 
-        # Hyperparameters
+        # Model hyperparameters
         self.node_features = node_features
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
@@ -1359,7 +1818,31 @@ class ProteinMPNN(nn.Module):
                 randn,
                 use_input_decoding_order=False,
                 decoding_order=None):
-        """ Graph-conditioned sequence model """
+        """
+        Forward pass: compute log probabilities for a sequence given structure.
+
+        Used for scoring existing sequences or computing gradients during training.
+
+        Args:
+            X (torch.Tensor): Backbone coordinates [B, L, 4, 3] or [B, L, 3] if CA-only
+            S (torch.Tensor): Amino acid sequence indices [B, L]
+            mask (torch.Tensor): Valid residue mask [B, L]
+            chain_M (torch.Tensor): Design mask (1=design, 0=fixed) [B, L]
+            residue_idx (torch.Tensor): Residue indices for positional encoding [B, L]
+            chain_encoding_all (torch.Tensor): Chain IDs [B, L]
+            randn (torch.Tensor): Random noise for decoding order [B, L]
+            use_input_decoding_order (bool): Use provided decoding order instead of random
+            decoding_order (torch.Tensor): Explicit decoding order if provided [B, L]
+
+        Returns:
+            torch.Tensor: Log probabilities [B, L, 21]
+
+        Data Flow:
+            1. Extract graph features from structure (E, E_idx)
+            2. Encode structure with full self-attention
+            3. Decode sequence autoregressively with masked attention
+            4. Project to amino acid logits and apply log softmax
+        """
         device = X.device
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
@@ -1429,6 +1912,48 @@ class ProteinMPNN(nn.Module):
                pssm_log_odds_mask=None,
                pssm_bias_flag=None,
                bias_by_res=None):
+        """
+        Sample amino acid sequences for a given protein backbone.
+
+        Autoregressive sampling with various constraints and biases.
+        Positions are sampled in random order (controlled by randn).
+
+        Args:
+            X (torch.Tensor): Backbone coordinates [B, L, 4, 3] or [B, L, 3]
+            randn (torch.Tensor): Random noise for decoding order [B, L]
+            S_true (torch.Tensor): Ground truth sequence (for fixed positions) [B, L]
+            chain_mask (torch.Tensor): Positions to design (1) vs. keep fixed (0) [B, L]
+            chain_encoding_all (torch.Tensor): Chain IDs [B, L]
+            residue_idx (torch.Tensor): Residue indices [B, L]
+            mask (torch.Tensor): Valid residue mask [B, L]
+            temperature (float): Sampling temperature (higher = more diverse)
+            omit_AAs_np (np.array): Global amino acid omission mask [21]
+            bias_AAs_np (np.array): Global amino acid bias [21]
+            chain_M_pos (torch.Tensor): Position-specific design mask [B, L]
+            omit_AA_mask (torch.Tensor): Position-specific AA omission [B, L, 21]
+            pssm_coef (torch.Tensor): PSSM mixing coefficient [B, L]
+            pssm_bias (torch.Tensor): PSSM bias matrix [B, L, 21]
+            pssm_multi (float): PSSM weight (0=ignore, 1=only PSSM)
+            pssm_log_odds_flag (bool): Use PSSM log-odds filtering
+            pssm_log_odds_mask (torch.Tensor): PSSM log-odds mask [B, L, 21]
+            pssm_bias_flag (bool): Use PSSM bias
+            bias_by_res (torch.Tensor): Per-residue AA bias [B, L, 21]
+
+        Returns:
+            dict: Dictionary containing:
+                - 'S': Sampled sequences [B, L]
+                - 'probs': Sampling probabilities [B, L, 21]
+                - 'decoding_order': Order positions were sampled [B, L]
+
+        Sampling Process:
+            1. Encode structure with encoder
+            2. For each position in random order:
+                a. Update decoder hidden states
+                b. Compute amino acid logits
+                c. Apply temperature, biases, and constraints
+                d. Sample amino acid from distribution
+                e. Update sequence embedding
+        """
         device = X.device
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
@@ -1600,6 +2125,40 @@ class ProteinMPNN(nn.Module):
                     tied_pos=None,
                     tied_beta=None,
                     bias_by_res=None):
+        """
+        Sample sequences with tied position constraints.
+
+        Similar to sample() but enforces that certain positions must have
+        the same amino acid. Critical for designing symmetric proteins,
+        homooligomers, or enforcing structural symmetry constraints.
+
+        Args:
+            (same as sample() method, plus:)
+            tied_pos (list): List of lists of position indices that must be tied
+                Example: [[0,10,20], [5,15]] means positions 0,10,20 get same AA
+                and positions 5,15 get same AA
+            tied_beta (torch.Tensor): Weighting for tied positions [L]
+                Controls how strongly each position contributes to tied sampling
+
+        Returns:
+            dict: Same as sample() method
+
+        Tied Sampling Process:
+            1. Encode structure
+            2. Reorder decoding to respect tied constraints
+               (all tied positions sampled together)
+            3. For each group of tied positions:
+                a. Compute logits at all tied positions
+                b. Combine logits with tied_beta weights
+                c. Sample single amino acid
+                d. Assign to all tied positions
+            4. Continue with remaining positions
+
+        Use Cases:
+            - Symmetric protein design (C2, C3, etc.)
+            - Homooligomer design
+            - Enforcing sequence repeats
+        """
         device = X.device
 
         # Prepare node and edge embeddings
@@ -1747,7 +2306,38 @@ class ProteinMPNN(nn.Module):
                           chain_encoding_all,
                           randn,
                           backbone_only=False):
-        """ Graph-conditioned sequence model """
+        """
+        Calculate conditional amino acid probabilities at each position.
+
+        Computes p(AA_i | rest of sequence, backbone) for each position i.
+        Useful for analyzing sequence-structure compatibility and predicting
+        effects of mutations.
+
+        Args:
+            X (torch.Tensor): Backbone coordinates [B, L, 4, 3] or [B, L, 3]
+            S (torch.Tensor): Current amino acid sequence [B, L]
+            mask (torch.Tensor): Valid residue mask [B, L]
+            chain_M (torch.Tensor): Design mask [B, L]
+            residue_idx (torch.Tensor): Residue indices [B, L]
+            chain_encoding_all (torch.Tensor): Chain IDs [B, L]
+            randn (torch.Tensor): Random noise for ordering [B, L]
+            backbone_only (bool): If True, condition only on backbone (no sequence)
+                If False, condition on both backbone and rest of sequence
+
+        Returns:
+            torch.Tensor: Log conditional probabilities [B, L, 21]
+
+        Process:
+            For each position i:
+            1. Mask position i as "unknown"
+            2. Run decoder with all other positions known
+            3. Record p(AA_i | everything else)
+
+        Applications:
+            - Mutation effect prediction
+            - Sequence-structure compatibility analysis
+            - Identifying challenging positions
+        """
         device = X.device
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
@@ -1819,7 +2409,36 @@ class ProteinMPNN(nn.Module):
         return log_conditional_probs
 
     def unconditional_probs(self, X, mask, residue_idx, chain_encoding_all):
-        """ Graph-conditioned sequence model """
+        """
+        Calculate unconditional amino acid probabilities from backbone only.
+
+        Computes p(AA_i | backbone) with no sequence information.
+        All positions are predicted independently based purely on structure.
+
+        Args:
+            X (torch.Tensor): Backbone coordinates [B, L, 4, 3] or [B, L, 3]
+            mask (torch.Tensor): Valid residue mask [B, L]
+            residue_idx (torch.Tensor): Residue indices [B, L]
+            chain_encoding_all (torch.Tensor): Chain IDs [B, L]
+
+        Returns:
+            torch.Tensor: Log unconditional probabilities [B, L, 21]
+
+        Process:
+            1. Encode backbone structure
+            2. Decode with no sequence information (all positions masked)
+            3. Predict amino acid probabilities independently at each position
+
+        Differences from conditional_probs:
+            - No sequence context used
+            - All positions predicted in parallel (not autoregressively)
+            - Faster but less accurate than conditional probabilities
+
+        Applications:
+            - Quick structure-based sequence prediction
+            - Baseline for sequence design
+            - Identifying structurally constrained positions
+        """
         device = X.device
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
