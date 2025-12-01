@@ -1,3 +1,11 @@
+"""
+CIF file parser for extracting protein structure information from mmCIF format.
+
+This module parses gzip-compressed mmCIF files (PDB format) to extract protein
+sequences, 3D coordinates, assembly information, and structure quality metrics.
+It also provides utilities for structure alignment and chain relationship analysis.
+"""
+
 import pdbx
 from pdbx.reader.PdbxReader import PdbxReader
 from pdbx.reader.PdbxContainers import DataCategory
@@ -12,6 +20,7 @@ from itertools import combinations, permutations
 import tempfile
 import subprocess
 
+# Standard amino acid names (3-letter to 1-letter mapping)
 RES_NAMES = [
     'ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'ILE',
     'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP', 'TYR', 'VAL'
@@ -19,8 +28,9 @@ RES_NAMES = [
 
 RES_NAMES_1 = 'ARNDCQEGHILKMFPSTWYV'
 
-to1letter = {aaa: a for a, aaa in zip(RES_NAMES_1, RES_NAMES)}
-to3letter = {a: aaa for a, aaa in zip(RES_NAMES_1, RES_NAMES)}
+# Create mapping dictionaries between 1-letter and 3-letter amino acid codes
+to1letter = {aaa: a for a, aaa in zip(RES_NAMES_1, RES_NAMES)}  # 3-letter to 1-letter
+to3letter = {a: aaa for a, aaa in zip(RES_NAMES_1, RES_NAMES)}  # 1-letter to 3-letter
 
 ATOM_NAMES = [
     ("N", "CA", "C", "O", "CB"),  # ala
@@ -62,14 +72,33 @@ aa2idx.update({(r, 'OXT'): 3 for r in RES_NAMES})
 
 
 def writepdb(f, xyz, seq, bfac=None):
+    """
+    Write protein structure in PDB format to a file object.
 
-    #f = open(filename,"w")
+    Parameters
+    ----------
+    f : file object
+        Open file object to write PDB format to
+    xyz : np.ndarray
+        Atom coordinates [L, num_atoms, 3] where L is sequence length
+    seq : str
+        Protein sequence (1-letter amino acid codes)
+    bfac : np.ndarray, optional
+        B-factors (temperature factors) [L, num_atoms]
+
+    Returns
+    -------
+    np.ndarray
+        CA atom indices that were written to PDB file
+    """
+    # Reset file position to beginning
     f.seek(0)
 
-    ctr = 1
+    ctr = 1  # Atom counter for PDB numbering
     seq = str(seq)
     L = len(seq)
 
+    # Use zero B-factors if not provided
     if bfac is None:
         bfac = np.zeros((L))
 
@@ -96,9 +125,27 @@ def writepdb(f, xyz, seq, bfac=None):
 
 
 def TMalign(chainA, chainB):
+    """
+    Align two protein chains using TMalign structural alignment algorithm.
 
-    # temp files to save the two input protein chains
-    # and TMalign transformation
+    TMalign computes structure-based sequence alignments and returns transformation
+    matrices to superpose one structure onto another.
+
+    Parameters
+    ----------
+    chainA : dict
+        Chain data with keys 'xyz' [L, 14, 3], 'seq' (string), 'bfac' [L, 14]
+    chainB : dict
+        Chain data with same keys as chainA
+
+    Returns
+    -------
+    tuple
+        - resAB: dict with alignment A->B containing 'aln', 't', 'u', 'rmsd', 'tm', 'seqid'
+        - resBA: dict with alignment B->A containing same keys
+        Returns (None, None) if TMalign fails
+    """
+    # Create temporary files to store PDB structures and alignment results
     fA = tempfile.NamedTemporaryFile(mode='w+t', dir='/dev/shm')
     fB = tempfile.NamedTemporaryFile(mode='w+t', dir='/dev/shm')
     mtx = tempfile.NamedTemporaryFile(mode='w+t', dir='/dev/shm')
@@ -296,23 +343,48 @@ def parseAssemblies(data, chids):
 
 
 def parse_mmcif(filename):
+    """
+    Parse mmCIF file and extract protein structure information.
 
-    #print(filename)
+    Reads protein sequences, atomic coordinates, B-factors, occupancy information,
+    and biological assembly definitions from a gzip-compressed mmCIF file.
 
-    chains = {}  # 'chain_id' -> chain_strucure
+    Parameters
+    ----------
+    filename : str
+        Path to gzip-compressed mmCIF file
 
-    # read a gzipped .cif file
+    Returns
+    -------
+    tuple
+        - chains: dict mapping chain IDs to structure data with keys:
+          - 'seq': amino acid sequence (1-letter code)
+          - 'xyz': atomic coordinates [L, 14, 3] (14 possible atoms per residue)
+          - 'mask': boolean mask for present atoms [L, 14]
+          - 'bfac': B-factors (temperature factors) [L, 14]
+          - 'occ': occupancy values [L, 14]
+        - metadata: dict with structure information:
+          - 'method': experimental method (e.g., 'X-RAY_DIFFRACTION')
+          - 'date': deposition date
+          - 'resolution': structure resolution in Angstroms
+          - 'chains': list of chain IDs
+          - 'seq': sequence information
+          - 'id': PDB ID
+          - 'tm': TM-align scores between chains
+          - 'asmb_*': assembly information
+    """
+    # Dictionary to store chain structures
+    chains = {}  # 'chain_id' -> chain_structure
+
+    # Read gzip-compressed mmCIF file
     data = []
     with gzip.open(filename, 'rt') as cif:
         reader = PdbxReader(cif)
         reader.read(data)
-    data = data[0]
+    data = data[0]  # Get the first (and typically only) data block
 
-    #
-    # get sequences
-    #
-
-    # map chain entity to chain ID
+    # Extract sequence information
+    # Map chain IDs to entity sequences
     entity_poly = data.getObj('entity_poly')
     if entity_poly is None:
         return {}, {}
@@ -504,42 +576,57 @@ def parse_mmcif(filename):
     return chains, metadata
 
 
-IN = sys.argv[1]
-OUT = sys.argv[2]
+# Main script: parse command-line arguments and process mmCIF file
+if __name__ == "__main__":
+    # Get input and output paths from command line
+    IN = sys.argv[1]  # Input mmCIF file path
+    OUT = sys.argv[2]  # Output prefix for PyTorch tensors
 
-chains, metadata = parse_mmcif(IN)
-ID = metadata['id']
+    # Parse the mmCIF file to extract chains and metadata
+    chains, metadata = parse_mmcif(IN)
+    ID = metadata['id']
 
-tm_pairs = get_tm_pairs(chains)
-if 'chains' in metadata.keys() and len(metadata['chains']) > 0:
-    chids = metadata['chains']
-    tm = []
-    for a in chids:
-        tm_a = []
-        for b in chids:
-            tm_ab = tm_pairs[(a, b)]
-            if tm_ab is None:
-                tm_a.append([0.0, 0.0, 999.9])
-            else:
-                tm_a.append([tm_ab[k] for k in ['tm', 'seqid', 'rmsd']])
-        tm.append(tm_a)
-    metadata.update({'tm': tm})
+    # Compute structural alignments between all chain pairs using TMalign
+    tm_pairs = get_tm_pairs(chains)
 
-for k, v in chains.items():
-    nres = (v['mask'][:, :3].sum(1) == 3).sum()
-    print(">%s_%s %s %s %s %d %d\n%s" %
-          (ID, k, metadata['date'], metadata['method'], metadata['resolution'],
-           len(v['seq']), nres, v['seq']))
+    # Organize TM-score results into matrix form if chains exist
+    if 'chains' in metadata.keys() and len(metadata['chains']) > 0:
+        chids = metadata['chains']
+        tm = []
+        for a in chids:
+            tm_a = []
+            for b in chids:
+                tm_ab = tm_pairs[(a, b)]
+                if tm_ab is None:
+                    # Default values if alignment failed
+                    tm_a.append([0.0, 0.0, 999.9])
+                else:
+                    # Extract TM-score, sequence identity, and RMSD
+                    tm_a.append([tm_ab[k] for k in ['tm', 'seqid', 'rmsd']])
+            tm.append(tm_a)
+        metadata.update({'tm': tm})
 
-    torch.save(
-        {
-            kc: torch.Tensor(vc) if kc != 'seq' else str(vc)
-            for kc, vc in v.items()
-        }, f"{OUT}_{k}.pt")
+    # Save each chain as a separate PyTorch tensor file
+    for k, v in chains.items():
+        # Count residues with complete backbone atoms (N, CA, C)
+        nres = (v['mask'][:, :3].sum(1) == 3).sum()
+        # Print summary to stdout
+        print(">%s_%s %s %s %s %d %d\n%s" %
+              (ID, k, metadata['date'], metadata['method'], metadata['resolution'],
+               len(v['seq']), nres, v['seq']))
 
-meta_pt = {}
-for k, v in metadata.items():
-    if "asmb_xform" in k or k == "tm":
-        v = torch.Tensor(v)
-    meta_pt.update({k: v})
-torch.save(meta_pt, f"{OUT}.pt")
+        # Save chain structure to PyTorch tensor file
+        torch.save(
+            {
+                kc: torch.Tensor(vc) if kc != 'seq' else str(vc)
+                for kc, vc in v.items()
+            }, f"{OUT}_{k}.pt")
+
+    # Save metadata to PyTorch tensor file
+    meta_pt = {}
+    for k, v in metadata.items():
+        # Convert transformation matrices and TM-score matrices to tensors
+        if "asmb_xform" in k or k == "tm":
+            v = torch.Tensor(v)
+        meta_pt.update({k: v})
+    torch.save(meta_pt, f"{OUT}.pt")

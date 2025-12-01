@@ -1,3 +1,19 @@
+"""
+Model utility functions for ProteinMPNN training.
+
+This module contains core functions and classes for the ProteinMPNN model, including:
+- Feature extraction and featurization of protein batches
+- Loss computation functions (NLL and label-smoothed losses)
+- Graph gathering functions for neighbor aggregation
+- Transformer-based encoder and decoder layers
+- Protein feature extraction and RBF computations
+- The main ProteinMPNN model architecture
+- Noam optimizer implementation for learning rate scheduling
+
+The module supports training on GPU with mixed precision and gradient checkpointing
+for memory efficiency.
+"""
+
 from __future__ import print_function
 import json, time, os, sys, glob
 import shutil
@@ -17,24 +33,66 @@ import itertools
 
 
 def featurize(batch, device):
+    """
+    Convert a batch of protein structures into tensor features for model input.
+
+    This function processes a batch of protein structure dictionaries and extracts:
+    - Backbone coordinates (N, CA, C, O atoms)
+    - Sequence information encoded as integers
+    - Mask information for which residues need to be predicted
+    - Chain encoding to distinguish different chains
+    - Residue indexing with chain offsets
+    - Self-interaction mask for chain boundaries
+
+    Parameters
+    ----------
+    batch : list of dict
+        List of protein structure dictionaries, each containing:
+        - 'seq': concatenated sequence string
+        - 'masked_list': list of chain IDs to be masked (predicted)
+        - 'visible_list': list of chain IDs to be visible (observed)
+        - 'seq_chain_X': sequence for chain X
+        - 'coords_chain_X': dict with backbone atom coordinates for chain X
+        - 'num_of_chains': number of chains
+    device : torch.device
+        Device to place tensors on (CPU or CUDA)
+
+    Returns
+    -------
+    tuple
+        - X: backbone coordinates [B, L, 4, 3] (batch, length, 4 atoms, xyz)
+        - S: amino acid sequence labels [B, L]
+        - mask: valid positions [B, L] (1.0 for atoms with coordinates)
+        - lengths: sequence lengths per sample [B]
+        - chain_M: masking indicator [B, L] (1.0 for positions to predict)
+        - residue_idx: residue indexing with chain offsets [B, L]
+        - mask_self: chain boundary mask [B, L, L]
+        - chain_encoding_all: chain assignment [B, L]
+    """
+    # Define amino acid alphabet and initialize batch dimensions
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
     B = len(batch)
+
+    # Calculate sequence lengths for each sample in batch
     lengths = np.array([len(b['seq']) for b in batch],
-                       dtype=np.int32)  #sum of chain seq lengths
-    L_max = max([len(b['seq']) for b in batch])
-    X = np.zeros([B, L_max, 4, 3])
+                       dtype=np.int32)  # sum of all chain seq lengths
+    L_max = max([len(b['seq']) for b in batch])  # Maximum sequence length
+
+    # Initialize output tensors with batch and maximum sequence length
+    X = np.zeros([B, L_max, 4, 3])  # Backbone atom coordinates (N, CA, C, O)
     residue_idx = -100 * np.ones(
-        [B, L_max], dtype=np.int32)  #residue idx with jumps across chains
+        [B, L_max], dtype=np.int32)  # Residue indexing with chain offsets
     chain_M = np.zeros(
         [B, L_max], dtype=np.int32
-    )  #1.0 for the bits that need to be predicted, 0.0 for the bits that are given
+    )  # Masking indicator: 1.0 for positions to predict, 0.0 for given
     mask_self = np.ones(
         [B, L_max, L_max], dtype=np.int32
-    )  #for interface loss calculation - 0.0 for self interaction, 1.0 for other
+    )  # Chain boundary mask: 0.0 for intra-chain, 1.0 for inter-chain
     chain_encoding_all = np.zeros(
         [B, L_max], dtype=np.int32
-    )  #integer encoding for chains 0, 0, 0,...0, 1, 1,..., 1, 2, 2, 2...
-    S = np.zeros([B, L_max], dtype=np.int32)  #sequence AAs integers
+    )  # Chain ID assignment (0 for chain A, 1 for chain B, etc.)
+    S = np.zeros([B, L_max], dtype=np.int32)  # Amino acid sequence labels
+    # Create extended alphabet to support up to 352 chains
     init_alphabet = [
         'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
         'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b',
@@ -43,18 +101,26 @@ def featurize(batch, device):
     ]
     extra_alphabet = [str(item) for item in list(np.arange(300))]
     chain_letters = init_alphabet + extra_alphabet
+
+    # Process each sample in the batch
     for i, b in enumerate(batch):
+        # Extract masked (to be predicted) and visible (observed) chains
         masked_chains = b['masked_list']
         visible_chains = b['visible_list']
         all_chains = masked_chains + visible_chains
         visible_temp_dict = {}
         masked_temp_dict = {}
+
+        # Build sequence dictionaries for quick lookup
         for step, letter in enumerate(all_chains):
             chain_seq = b[f'seq_chain_{letter}']
             if letter in visible_chains:
                 visible_temp_dict[letter] = chain_seq
             elif letter in masked_chains:
                 masked_temp_dict[letter] = chain_seq
+
+        # Resolve duplicate sequences: if a masked chain has same sequence as visible chain,
+        # mark the visible chain as masked and vice versa
         for km, vm in masked_temp_dict.items():
             for kv, vv in visible_temp_dict.items():
                 if vm == vv:
@@ -62,8 +128,10 @@ def featurize(batch, device):
                         masked_chains.append(kv)
                     if kv in visible_chains:
                         visible_chains.remove(kv)
+
+        # Update chain lists and randomly shuffle order for diversity
         all_chains = masked_chains + visible_chains
-        random.shuffle(all_chains)  #randomly shuffle chain order
+        random.shuffle(all_chains)  # Randomly shuffle chain order for training variation
         num_chains = b['num_of_chains']
         mask_dict = {}
         x_chain_list = []
@@ -166,63 +234,184 @@ def featurize(batch, device):
 
 
 def loss_nll(S, log_probs, mask):
-    """ Negative log probabilities """
+    """
+    Compute negative log likelihood loss with accuracy metrics.
+
+    Parameters
+    ----------
+    S : torch.Tensor
+        Ground truth amino acid labels [B, L]
+    log_probs : torch.Tensor
+        Log probabilities from model [B, L, 21]
+    mask : torch.Tensor
+        Valid position mask [B, L]
+
+    Returns
+    -------
+    tuple
+        - loss: per-position loss [B, L]
+        - loss_av: masked average loss (scalar)
+        - true_false: accuracy indicator [B, L] (1.0 for correct predictions)
+    """
     criterion = torch.nn.NLLLoss(reduction='none')
+    # Reshape for loss computation and reshape back to original dimensions
     loss = criterion(log_probs.contiguous().view(-1, log_probs.size(-1)),
                      S.contiguous().view(-1)).view(S.size())
-    S_argmaxed = torch.argmax(log_probs, -1)  #[B, L]
-    true_false = (S == S_argmaxed).float()
+    # Compute predictions and accuracy
+    S_argmaxed = torch.argmax(log_probs, -1)  # Get most likely amino acid [B, L]
+    true_false = (S == S_argmaxed).float()  # 1.0 where prediction is correct
+    # Compute masked average loss
     loss_av = torch.sum(loss * mask) / torch.sum(mask)
     return loss, loss_av, true_false
 
 
 def loss_smoothed(S, log_probs, mask, weight=0.1):
-    """ Negative log probabilities """
+    """
+    Compute label-smoothed cross-entropy loss.
+
+    Label smoothing improves model generalization by preventing overconfident predictions.
+    The ground truth distribution is smoothed by adding uniform probability mass.
+
+    Parameters
+    ----------
+    S : torch.Tensor
+        Ground truth amino acid labels [B, L]
+    log_probs : torch.Tensor
+        Log probabilities from model [B, L, 21]
+    mask : torch.Tensor
+        Valid position mask [B, L]
+    weight : float
+        Label smoothing weight (default 0.1)
+
+    Returns
+    -------
+    tuple
+        - loss: per-position loss [B, L]
+        - loss_av: masked average loss (scalar)
+    """
+    # Convert labels to one-hot encoding
     S_onehot = torch.nn.functional.one_hot(S, 21).float()
 
-    # Label smoothing
+    # Apply label smoothing: add uniform probability to all classes
     S_onehot = S_onehot + weight / float(S_onehot.size(-1))
+    # Renormalize to sum to 1
     S_onehot = S_onehot / S_onehot.sum(-1, keepdim=True)
 
+    # Compute cross-entropy loss
     loss = -(S_onehot * log_probs).sum(-1)
-    loss_av = torch.sum(loss * mask) / 2000.0  #fixed
+    # Compute masked average loss (fixed denominator of 2000 for stability)
+    loss_av = torch.sum(loss * mask) / 2000.0
     return loss, loss_av
 
 
-# The following gather functions
+# Graph neighbor aggregation functions
 def gather_edges(edges, neighbor_idx):
-    # Features [B,N,N,C] at Neighbor indices [B,N,K] => Neighbor features [B,N,K,C]
+    """
+    Gather edge features for neighbor indices.
+
+    Parameters
+    ----------
+    edges : torch.Tensor
+        Edge features [B, N, N, C] (batch, nodes, nodes, channels)
+    neighbor_idx : torch.Tensor
+        Neighbor indices [B, N, K]
+
+    Returns
+    -------
+    torch.Tensor
+        Gathered edge features [B, N, K, C] for neighbors of each node
+    """
+    # Expand indices to match feature dimension
     neighbors = neighbor_idx.unsqueeze(-1).expand(-1, -1, -1, edges.size(-1))
+    # Gather features at neighbor indices
     edge_features = torch.gather(edges, 2, neighbors)
     return edge_features
 
 
 def gather_nodes(nodes, neighbor_idx):
-    # Features [B,N,C] at Neighbor indices [B,N,K] => [B,N,K,C]
-    # Flatten and expand indices per batch [B,N,K] => [B,NK] => [B,NK,C]
+    """
+    Gather node features for neighbor indices.
+
+    Parameters
+    ----------
+    nodes : torch.Tensor
+        Node features [B, N, C] (batch, nodes, channels)
+    neighbor_idx : torch.Tensor
+        Neighbor indices [B, N, K]
+
+    Returns
+    -------
+    torch.Tensor
+        Gathered node features [B, N, K, C] for neighbors of each node
+    """
+    # Flatten neighbor indices to batch dimension
     neighbors_flat = neighbor_idx.view((neighbor_idx.shape[0], -1))
+    # Expand indices to match feature dimension
     neighbors_flat = neighbors_flat.unsqueeze(-1).expand(-1, -1, nodes.size(2))
-    # Gather and re-pack
+    # Gather node features at flattened neighbor indices
     neighbor_features = torch.gather(nodes, 1, neighbors_flat)
+    # Reshape back to [B, N, K, C]
     neighbor_features = neighbor_features.view(
         list(neighbor_idx.shape)[:3] + [-1])
     return neighbor_features
 
 
 def gather_nodes_t(nodes, neighbor_idx):
-    # Features [B,N,C] at Neighbor index [B,K] => Neighbor features[B,K,C]
+    """
+    Gather node features for single neighbor index per batch.
+
+    Parameters
+    ----------
+    nodes : torch.Tensor
+        Node features [B, N, C]
+    neighbor_idx : torch.Tensor
+        Neighbor indices [B, K]
+
+    Returns
+    -------
+    torch.Tensor
+        Gathered node features [B, K, C]
+    """
+    # Expand indices to match feature dimension
     idx_flat = neighbor_idx.unsqueeze(-1).expand(-1, -1, nodes.size(2))
+    # Gather node features
     neighbor_features = torch.gather(nodes, 1, idx_flat)
     return neighbor_features
 
 
 def cat_neighbors_nodes(h_nodes, h_neighbors, E_idx):
+    """
+    Concatenate node features with their neighbor features.
+
+    Parameters
+    ----------
+    h_nodes : torch.Tensor
+        Node features [B, N, C]
+    h_neighbors : torch.Tensor
+        Neighbor features [B, N, K, C]
+    E_idx : torch.Tensor
+        Neighbor indices [B, N, K]
+
+    Returns
+    -------
+    torch.Tensor
+        Concatenated features [B, N, K, 2*C]
+    """
+    # Gather self-node features repeated for each neighbor
     h_nodes = gather_nodes(h_nodes, E_idx)
+    # Concatenate neighbor and node features
     h_nn = torch.cat([h_neighbors, h_nodes], -1)
     return h_nn
 
 
 class EncLayer(nn.Module):
+    """
+    Graph Transformer encoder layer for protein structure processing.
+
+    This layer performs message passing on a graph-structured representation of protein
+    structures, updating both node (residue) and edge (pair) features through multiple
+    sub-layers with layer normalization and dropout.
+    """
 
     def __init__(self,
                  num_hidden,
@@ -230,53 +419,109 @@ class EncLayer(nn.Module):
                  dropout=0.1,
                  num_heads=None,
                  scale=30):
+        """
+        Initialize encoder layer.
+
+        Parameters
+        ----------
+        num_hidden : int
+            Dimension of node features
+        num_in : int
+            Dimension of edge features
+        dropout : float
+            Dropout probability
+        num_heads : int, optional
+            Unused parameter (kept for compatibility)
+        scale : float
+            Scaling factor for aggregation (default 30)
+        """
         super(EncLayer, self).__init__()
         self.num_hidden = num_hidden
         self.num_in = num_in
         self.scale = scale
+        # Dropout layers for regularization
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
+        # Layer normalization for stability
         self.norm1 = nn.LayerNorm(num_hidden)
         self.norm2 = nn.LayerNorm(num_hidden)
         self.norm3 = nn.LayerNorm(num_hidden)
 
+        # Node update network (processes concatenated node and edge features)
         self.W1 = nn.Linear(num_hidden + num_in, num_hidden, bias=True)
         self.W2 = nn.Linear(num_hidden, num_hidden, bias=True)
         self.W3 = nn.Linear(num_hidden, num_hidden, bias=True)
+        # Edge update network
         self.W11 = nn.Linear(num_hidden + num_in, num_hidden, bias=True)
         self.W12 = nn.Linear(num_hidden, num_hidden, bias=True)
         self.W13 = nn.Linear(num_hidden, num_hidden, bias=True)
+        # Activation function
         self.act = torch.nn.GELU()
+        # Position-wise feedforward network
         self.dense = PositionWiseFeedForward(num_hidden, num_hidden * 4)
 
     def forward(self, h_V, h_E, E_idx, mask_V=None, mask_attend=None):
-        """ Parallel computation of full transformer layer """
+        """
+        Forward pass for encoder layer.
 
+        Parameters
+        ----------
+        h_V : torch.Tensor
+            Node features [B, N, C]
+        h_E : torch.Tensor
+            Edge features [B, N, K, C]
+        E_idx : torch.Tensor
+            Neighbor indices [B, N, K]
+        mask_V : torch.Tensor, optional
+            Node mask [B, N]
+        mask_attend : torch.Tensor, optional
+            Attention mask [B, N, K]
+
+        Returns
+        -------
+        tuple
+            - h_V: updated node features [B, N, C]
+            - h_E: updated edge features [B, N, K, C]
+        """
+        # First sublayer: aggregate neighbor messages to update node features
         h_EV = cat_neighbors_nodes(h_V, h_E, E_idx)
         h_V_expand = h_V.unsqueeze(-2).expand(-1, -1, h_EV.size(-2), -1)
         h_EV = torch.cat([h_V_expand, h_EV], -1)
+        # Message computation with MLPs
         h_message = self.W3(self.act(self.W2(self.act(self.W1(h_EV)))))
+        # Apply attention mask if provided
         if mask_attend is not None:
             h_message = mask_attend.unsqueeze(-1) * h_message
+        # Aggregate messages and update node features
         dh = torch.sum(h_message, -2) / self.scale
         h_V = self.norm1(h_V + self.dropout1(dh))
 
+        # Second sublayer: position-wise feedforward network
         dh = self.dense(h_V)
         h_V = self.norm2(h_V + self.dropout2(dh))
+        # Apply node mask if provided
         if mask_V is not None:
             mask_V = mask_V.unsqueeze(-1)
             h_V = mask_V * h_V
 
+        # Third sublayer: update edge features based on updated nodes
         h_EV = cat_neighbors_nodes(h_V, h_E, E_idx)
         h_V_expand = h_V.unsqueeze(-2).expand(-1, -1, h_EV.size(-2), -1)
         h_EV = torch.cat([h_V_expand, h_EV], -1)
+        # Edge message computation
         h_message = self.W13(self.act(self.W12(self.act(self.W11(h_EV)))))
         h_E = self.norm3(h_E + self.dropout3(h_message))
         return h_V, h_E
 
 
 class DecLayer(nn.Module):
+    """
+    Graph Transformer decoder layer for protein sequence generation.
+
+    This layer is used in the autoregressive decoding phase, processing sequence
+    embeddings and edge features to predict amino acid identities at each position.
+    """
 
     def __init__(self,
                  num_hidden,
@@ -284,39 +529,80 @@ class DecLayer(nn.Module):
                  dropout=0.1,
                  num_heads=None,
                  scale=30):
+        """
+        Initialize decoder layer.
+
+        Parameters
+        ----------
+        num_hidden : int
+            Dimension of node features
+        num_in : int
+            Dimension of edge features
+        dropout : float
+            Dropout probability
+        num_heads : int, optional
+            Unused parameter (kept for compatibility)
+        scale : float
+            Scaling factor for aggregation (default 30)
+        """
         super(DecLayer, self).__init__()
         self.num_hidden = num_hidden
         self.num_in = num_in
         self.scale = scale
+        # Dropout and normalization
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(num_hidden)
         self.norm2 = nn.LayerNorm(num_hidden)
 
+        # Message passing networks
         self.W1 = nn.Linear(num_hidden + num_in, num_hidden, bias=True)
         self.W2 = nn.Linear(num_hidden, num_hidden, bias=True)
         self.W3 = nn.Linear(num_hidden, num_hidden, bias=True)
         self.act = torch.nn.GELU()
+        # Position-wise feedforward network
         self.dense = PositionWiseFeedForward(num_hidden, num_hidden * 4)
 
     def forward(self, h_V, h_E, mask_V=None, mask_attend=None):
-        """ Parallel computation of full transformer layer """
+        """
+        Forward pass for decoder layer.
 
-        # Concatenate h_V_i to h_E_ij
+        Parameters
+        ----------
+        h_V : torch.Tensor
+            Node features [B, N, C]
+        h_E : torch.Tensor
+            Edge features [B, N, K, C]
+        mask_V : torch.Tensor, optional
+            Node mask [B, N]
+        mask_attend : torch.Tensor, optional
+            Attention mask [B, N, K]
+
+        Returns
+        -------
+        torch.Tensor
+            Updated node features [B, N, C]
+        """
+        # Message passing: concatenate current node features with neighbor edge features
         h_V_expand = h_V.unsqueeze(-2).expand(-1, -1, h_E.size(-2), -1)
         h_EV = torch.cat([h_V_expand, h_E], -1)
 
+        # Compute messages through MLPs
         h_message = self.W3(self.act(self.W2(self.act(self.W1(h_EV)))))
+        # Apply attention mask if provided
         if mask_attend is not None:
             h_message = mask_attend.unsqueeze(-1) * h_message
+        # Aggregate messages with scaling
         dh = torch.sum(h_message, -2) / self.scale
 
+        # Update node features with residual connection and normalization
         h_V = self.norm1(h_V + self.dropout1(dh))
 
-        # Position-wise feedforward
+        # Position-wise feedforward sub-layer
         dh = self.dense(h_V)
         h_V = self.norm2(h_V + self.dropout2(dh))
 
+        # Apply node mask if provided
         if mask_V is not None:
             mask_V = mask_V.unsqueeze(-1)
             h_V = mask_V * h_V
@@ -324,39 +610,100 @@ class DecLayer(nn.Module):
 
 
 class PositionWiseFeedForward(nn.Module):
+    """
+    Position-wise feedforward network used in transformer layers.
+
+    Standard FFN with input projection to higher dimension, GELU activation,
+    and output projection back to original dimension.
+    """
 
     def __init__(self, num_hidden, num_ff):
+        """
+        Initialize feedforward network.
+
+        Parameters
+        ----------
+        num_hidden : int
+            Input and output dimension
+        num_ff : int
+            Hidden dimension (typically 4x num_hidden)
+        """
         super(PositionWiseFeedForward, self).__init__()
+        # Expand to higher dimension
         self.W_in = nn.Linear(num_hidden, num_ff, bias=True)
+        # Project back to original dimension
         self.W_out = nn.Linear(num_ff, num_hidden, bias=True)
         self.act = torch.nn.GELU()
 
     def forward(self, h_V):
+        """Apply feedforward transformation."""
         h = self.act(self.W_in(h_V))
         h = self.W_out(h)
         return h
 
 
 class PositionalEncodings(nn.Module):
+    """
+    Relative positional encoding for sequence positions.
+
+    Encodes the relative distance between positions in the protein sequence,
+    distinguishing intra-chain and inter-chain relationships.
+    """
 
     def __init__(self, num_embeddings, max_relative_feature=32):
+        """
+        Initialize positional encoding.
+
+        Parameters
+        ----------
+        num_embeddings : int
+            Output embedding dimension
+        max_relative_feature : int
+            Maximum relative distance to encode (default 32)
+        """
         super(PositionalEncodings, self).__init__()
         self.num_embeddings = num_embeddings
         self.max_relative_feature = max_relative_feature
+        # Linear layer to project one-hot positions to embeddings
         self.linear = nn.Linear(2 * max_relative_feature + 1 + 1,
                                 num_embeddings)
 
     def forward(self, offset, mask):
+        """
+        Compute positional embeddings for relative distances.
+
+        Parameters
+        ----------
+        offset : torch.Tensor
+            Relative position offsets [B, N, K]
+        mask : torch.Tensor
+            Chain boundary mask (1 for same chain, 0 for different) [B, N, K]
+
+        Returns
+        -------
+        torch.Tensor
+            Positional embeddings [B, N, K, C]
+        """
+        # Clip relative distances to valid range, use special value for different chains
         d = torch.clip(offset + self.max_relative_feature, 0,
                        2 * self.max_relative_feature) * mask + (1 - mask) * (
                            2 * self.max_relative_feature + 1)
+        # Convert to one-hot representation
         d_onehot = torch.nn.functional.one_hot(
             d, 2 * self.max_relative_feature + 1 + 1)
+        # Project one-hot to embedding space
         E = self.linear(d_onehot.float())
         return E
 
 
 class ProteinFeatures(nn.Module):
+    """
+    Extract and embed geometric features from protein structures.
+
+    Computes graph edges based on spatial distances, radial basis function (RBF)
+    kernels for distance encoding, and relative positional embeddings for
+    sequence positions.
+    """
 
     def __init__(self,
                  edge_features,
@@ -366,7 +713,26 @@ class ProteinFeatures(nn.Module):
                  top_k=30,
                  augment_eps=0.,
                  num_chain_embeddings=16):
-        """ Extract protein features """
+        """
+        Initialize protein feature extractor.
+
+        Parameters
+        ----------
+        edge_features : int
+            Output dimension for edge embeddings
+        node_features : int
+            Output dimension for node embeddings
+        num_positional_embeddings : int
+            Dimension of positional embeddings (default 16)
+        num_rbf : int
+            Number of RBF kernels for distance encoding (default 16)
+        top_k : int
+            Number of nearest neighbors for graph edges (default 30)
+        augment_eps : float
+            Coordinate perturbation for data augmentation (default 0.0)
+        num_chain_embeddings : int
+            Unused parameter (default 16)
+        """
         super(ProteinFeatures, self).__init__()
         self.edge_features = edge_features
         self.node_features = node_features
@@ -567,9 +933,30 @@ class ProteinMPNN(nn.Module):
 
 
 class NoamOpt:
-    "Optim wrapper that implements rate."
+    """
+    Optimizer wrapper implementing Noam learning rate scheduling.
+
+    The learning rate follows: lr = factor * (d_model^-0.5) * min(step^-0.5, step * warmup^-1.5)
+    This schedule increases learning rate during warmup phase then decays it afterwards.
+    """
 
     def __init__(self, model_size, factor, warmup, optimizer, step):
+        """
+        Initialize Noam optimizer.
+
+        Parameters
+        ----------
+        model_size : int
+            Model hidden dimension (used for scaling)
+        factor : float
+            Scaling factor for learning rate
+        warmup : int
+            Number of warmup steps
+        optimizer : torch.optim.Optimizer
+            Underlying PyTorch optimizer
+        step : int
+            Starting step number (for resuming training)
+        """
         self.optimizer = optimizer
         self._step = step
         self.warmup = warmup
@@ -579,31 +966,65 @@ class NoamOpt:
 
     @property
     def param_groups(self):
-        """Return param_groups."""
+        """Return optimizer param groups for compatibility."""
         return self.optimizer.param_groups
 
     def step(self):
-        "Update parameters and rate"
+        """Update model parameters and learning rate."""
         self._step += 1
+        # Compute new learning rate based on current step
         rate = self.rate()
+        # Update learning rate for all parameter groups
         for p in self.optimizer.param_groups:
             p['lr'] = rate
         self._rate = rate
+        # Perform optimizer step
         self.optimizer.step()
 
     def rate(self, step=None):
-        "Implement `lrate` above"
+        """
+        Compute learning rate for given training step.
+
+        Parameters
+        ----------
+        step : int, optional
+            Training step (default uses current step)
+
+        Returns
+        -------
+        float
+            Learning rate for the given step
+        """
         if step is None:
             step = self._step
+        # Noam learning rate schedule
         return self.factor * \
             (self.model_size ** (-0.5) *
             min(step ** (-0.5), step * self.warmup ** (-1.5)))
 
     def zero_grad(self):
+        """Clear gradients in underlying optimizer."""
         self.optimizer.zero_grad()
 
 
 def get_std_opt(parameters, d_model, step):
+    """
+    Create a standard Noam-scheduled optimizer.
+
+    Parameters
+    ----------
+    parameters : iterable
+        Model parameters to optimize
+    d_model : int
+        Model hidden dimension
+    step : int
+        Starting training step
+
+    Returns
+    -------
+    NoamOpt
+        Optimizer with Noam learning rate schedule
+    """
     return NoamOpt(
         d_model, 2, 4000,
         torch.optim.Adam(parameters, lr=0, betas=(0.9, 0.98), eps=1e-9), step)
