@@ -1,3 +1,14 @@
+"""
+Utility functions and classes for protein structure data loading and processing.
+
+This module provides data loading infrastructure for ProteinMPNN training, including:
+- Dataset classes for handling protein structure data
+- Data loaders with length-based batching for efficiency
+- PDB file loading and structure assembly functions
+- Training/validation/test split management
+- Worker initialization for parallel data loading
+"""
+
 import torch
 from torch.utils.data import DataLoader
 import csv
@@ -9,6 +20,12 @@ import os
 
 
 class StructureDataset():
+    """
+    PyTorch Dataset for protein structures with validation and filtering.
+
+    Filters protein structures by sequence validity and length, providing
+    iteration over protein complexes for training.
+    """
 
     def __init__(self,
                  pdb_dict_list,
@@ -16,43 +33,74 @@ class StructureDataset():
                  truncate=None,
                  max_length=100,
                  alphabet='ACDEFGHIKLMNPQRSTVWYX'):
+        """
+        Initialize structure dataset.
+
+        Parameters
+        ----------
+        pdb_dict_list : list of dict
+            List of protein structure dictionaries with keys:
+            - 'seq': amino acid sequence
+            - 'name': structure identifier
+            - 'xyz': atomic coordinates
+            - 'idx': chain indices
+            - etc.
+        verbose : bool
+            Print progress information
+        truncate : int, optional
+            Maximum number of structures to load (for debugging)
+        max_length : int
+            Maximum sequence length to include
+        alphabet : str
+            Allowed amino acid characters
+        """
         alphabet_set = set([a for a in alphabet])
         discard_count = {'bad_chars': 0, 'too_long': 0, 'bad_seq_length': 0}
 
         self.data = []
 
         start = time.time()
+        # Filter and validate structures
         for i, entry in enumerate(pdb_dict_list):
             seq = entry['seq']
             name = entry['name']
 
+            # Check for invalid characters in sequence
             bad_chars = set([s for s in seq]).difference(alphabet_set)
             if len(bad_chars) == 0:
+                # Accept sequences within length limit
                 if len(entry['seq']) <= max_length:
                     self.data.append(entry)
                 else:
                     discard_count['too_long'] += 1
             else:
-                #print(name, bad_chars, entry['seq'])
+                # Skip sequences with invalid characters
                 discard_count['bad_chars'] += 1
 
-            # Truncate early
+            # Truncate early if specified (for debugging)
             if truncate is not None and len(self.data) == truncate:
                 return
 
             if verbose and (i + 1) % 1000 == 0:
                 elapsed = time.time() - start
-                #print('{} entries ({} loaded) in {:.1f} s'.format(len(self.data), i+1, elapsed))
+                # Progress update every 1000 structures
 
-            #print('Discarded', discard_count)
     def __len__(self):
+        """Return number of structures in dataset."""
         return len(self.data)
 
     def __getitem__(self, idx):
+        """Get structure at given index."""
         return self.data[idx]
 
 
 class StructureLoader():
+    """
+    Data loader that batches protein structures by similar lengths.
+
+    Creates batches of structures with similar sequence lengths to minimize
+    padding and improve computational efficiency.
+    """
 
     def __init__(self,
                  dataset,
@@ -60,21 +108,42 @@ class StructureLoader():
                  shuffle=True,
                  collate_fn=lambda x: x,
                  drop_last=False):
+        """
+        Initialize structure loader with length-based batching.
+
+        Parameters
+        ----------
+        dataset : StructureDataset
+            Dataset of protein structures
+        batch_size : int
+            Maximum batch size in tokens (sum of sequence lengths)
+        shuffle : bool
+            Whether to shuffle batch order (always on for epochs)
+        collate_fn : callable, optional
+            Custom collate function (unused, keeps default)
+        drop_last : bool, optional
+            Whether to drop last incomplete batch (unused)
+        """
         self.dataset = dataset
         self.size = len(dataset)
+        # Extract sequence lengths for all structures
         self.lengths = [len(dataset[i]['seq']) for i in range(self.size)]
         self.batch_size = batch_size
+        # Sort indices by sequence length for batching
         sorted_ix = np.argsort(self.lengths)
 
-        # Cluster into batches of similar sizes
+        # Cluster structures into batches of similar sizes
+        # Batches are created by adding structures until token limit is reached
         clusters, batch = [], []
         batch_max = 0
         for ix in sorted_ix:
             size = self.lengths[ix]
+            # Add to batch if within batch_size token limit
             if size * (len(batch) + 1) <= self.batch_size:
                 batch.append(ix)
                 batch_max = size
             else:
+                # Start new batch if limit exceeded
                 clusters.append(batch)
                 batch, batch_max = [], 0
         if len(batch) > 0:
@@ -82,16 +151,30 @@ class StructureLoader():
         self.clusters = clusters
 
     def __len__(self):
+        """Return number of batches."""
         return len(self.clusters)
 
     def __iter__(self):
+        """Iterate over batches, shuffling their order each epoch."""
         np.random.shuffle(self.clusters)
         for b_idx in self.clusters:
+            # Retrieve structures for this batch
             batch = [self.dataset[i] for i in b_idx]
             yield batch
 
 
 def worker_init_fn(worker_id):
+    """
+    Initialize random seed for data loading worker.
+
+    Called once per worker process to ensure different random sequences
+    across parallel data loaders.
+
+    Parameters
+    ----------
+    worker_id : int
+        Worker process ID (set automatically by DataLoader)
+    """
     np.random.seed()
 
 
@@ -139,6 +222,34 @@ def get_std_opt(parameters, d_model, step):
 
 
 def get_pdbs(data_loader, repeat=1, max_length=10000, num_units=1000000):
+    """
+    Load protein structures from PDB data loader and extract chain information.
+
+    Loads PDB structures from a DataLoader, extracts individual chains, removes
+    His-tags, and concatenates multi-chain complexes for training.
+
+    Parameters
+    ----------
+    data_loader : torch.utils.data.DataLoader
+        DataLoader providing PDB entries with coordinates and sequences
+    repeat : int
+        Number of times to iterate through data_loader (for resampling)
+    max_length : int
+        Maximum protein length to include
+    num_units : int
+        Maximum number of individual chain instances to load
+
+    Returns
+    -------
+    list of dict
+        List of protein structures with keys:
+        - 'seq': concatenated sequence
+        - 'xyz': atomic coordinates
+        - 'idx': chain indices
+        - 'masked': homologous chain indices
+        - 'label': structure identifier
+    """
+    # Create alphabet for chain naming (can handle up to 352 chains)
     init_alphabet = [
         'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
         'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b',
@@ -153,8 +264,10 @@ def get_pdbs(data_loader, repeat=1, max_length=10000, num_units=1000000):
     t0 = time.time()
     for _ in range(repeat):
         for step, t in enumerate(data_loader):
+            # Extract single element from batch dimension
             t = {k: v[0] for k, v in t.items()}
             c1 += 1
+            # Process structures that have a label field
             if 'label' in list(t):
                 my_dict = {}
                 s = 0
@@ -167,16 +280,23 @@ def get_pdbs(data_loader, repeat=1, max_length=10000, num_units=1000000):
                 coords_dict = {}
                 mask_list = []
                 visible_list = []
+                # Process multi-chain complexes (up to 352 chains)
                 if len(list(np.unique(t['idx']))) < 352:
+                    # Iterate over unique chains in the structure
                     for idx in list(np.unique(t['idx'])):
                         letter = chain_alphabet[idx]
+                        # Get residue indices for this chain
                         res = np.argwhere(t['idx'] == idx)
+                        # Extract sequence for this chain
                         initial_sequence = "".join(
                             list(np.array(list(t['seq']))[res][
                                 0,
                             ]))
+                        # Remove His-tags (6 consecutive H residues)
+                        # Check and remove C-terminal His-tag
                         if initial_sequence[-6:] == "HHHHHH":
                             res = res[:, :-6]
+                        # Check and remove N-terminal His-tag
                         if initial_sequence[0:6] == "HHHHHH":
                             res = res[:, 6:]
                         if initial_sequence[-7:-1] == "HHHHHH":
@@ -259,14 +379,40 @@ class PDB_dataset(torch.utils.data.Dataset):
 
 
 def loader_pdb(item, params):
+    """
+    Load a single PDB structure with its assembly information.
 
+    Loads protein coordinates and sequence for a specific chain, optionally
+    including biological assembly information with homologous chain identification.
+
+    Parameters
+    ----------
+    item : tuple
+        (PDB_ID_CHAIN_ID, additional_info) where PDB_ID_CHAIN_ID format is "PDBID_CHAINID"
+    params : dict
+        Configuration parameters with keys:
+        - 'DIR': base data directory
+        - 'HOMO': sequence identity threshold for homolog detection
+
+    Returns
+    -------
+    dict
+        Structure data with keys:
+        - 'seq': amino acid sequence
+        - 'xyz': atomic coordinates [L, 14, 3]
+        - 'idx': chain indices
+        - 'masked': homologous chain indices
+        - 'label': structure identifier
+    """
+    # Parse PDB ID and chain ID from item
     pdbid, chid = item[0].split('_')
+    # Construct file path: pdb_dir/pdb/XX/PDBID where XX is 2nd-3rd chars of PDBID
     PREFIX = "%s/pdb/%s/%s" % (params['DIR'], pdbid[1:3], pdbid)
 
-    # load metadata
+    # Load metadata and coordinate files
     if not os.path.isfile(PREFIX + ".pt"):
-        return {'seq': np.zeros(5)}
-    meta = torch.load(PREFIX + ".pt")
+        return {'seq': np.zeros(5)}  # Return dummy structure if file not found
+    meta = torch.load(PREFIX + ".pt")  # Load metadata (assembly info, etc.)
     asmb_ids = meta['asmb_ids']
     asmb_chains = meta['asmb_chains']
     chids = np.array(meta['chains'])
@@ -354,44 +500,81 @@ def loader_pdb(item, params):
 
 
 def build_training_clusters(params, debug):
+    """
+    Build training, validation, and test datasets from PDB list file.
+
+    Reads a CSV file with PDB metadata, filters by resolution and date,
+    and splits into training, validation, and test sets using sequence
+    similarity clustering.
+
+    Parameters
+    ----------
+    params : dict
+        Configuration parameters with keys:
+        - 'LIST': path to CSV file with PDB metadata
+        - 'VAL': path to file with validation cluster IDs
+        - 'TEST': path to file with test cluster IDs
+        - 'RESCUT': maximum resolution cutoff (Angstroms)
+        - 'DATCUT': date cutoff (ISO format)
+    debug : bool
+        If True, use small subset for debugging
+
+    Returns
+    -------
+    tuple
+        - train: dict mapping cluster_id to list of [PDB_ID, CHAIN_ID] pairs
+        - valid: dict mapping cluster_id to list of [PDB_ID, CHAIN_ID] pairs
+        - test: dict mapping cluster_id to list of [PDB_ID, CHAIN_ID] pairs
+    """
+    # Load validation and test cluster IDs
     val_ids = set([int(l) for l in open(params['VAL']).readlines()])
     test_ids = set([int(l) for l in open(params['TEST']).readlines()])
 
+    # Override with empty sets for debugging (use all as training)
     if debug:
         val_ids = []
         test_ids = []
 
-    # read & clean list.csv
+    # Read and filter PDB metadata from CSV file
     with open(params['LIST'], 'r') as f:
         reader = csv.reader(f)
-        next(reader)
+        next(reader)  # Skip header row
+        # Filter by resolution and deposition date
         rows = [[r[0], r[3], int(r[4])] for r in reader
-                if float(r[2]) <= params['RESCUT']
-                and parser.parse(r[1]) <= parser.parse(params['DATCUT'])]
+                if float(r[2]) <= params['RESCUT']  # Resolution cutoff
+                and parser.parse(r[1]) <= parser.parse(params['DATCUT'])]  # Date cutoff
 
-    # compile training and validation sets
+    # Initialize dataset dictionaries
     train = {}
     valid = {}
     test = {}
 
+    # Use small subset for debugging
     if debug:
         rows = rows[:20]
+
+    # Distribute PDB entries to train/val/test based on cluster IDs
     for r in rows:
-        if r[2] in val_ids:
-            if r[2] in valid.keys():
-                valid[r[2]].append(r[:2])
+        cluster_id = r[2]  # Cluster ID for sequence similarity clustering
+        pdb_chain = r[:2]  # [PDB_ID, CHAIN_ID]
+        # Assign to appropriate split
+        if cluster_id in val_ids:
+            if cluster_id in valid.keys():
+                valid[cluster_id].append(pdb_chain)
             else:
-                valid[r[2]] = [r[:2]]
-        elif r[2] in test_ids:
-            if r[2] in test.keys():
-                test[r[2]].append(r[:2])
+                valid[cluster_id] = [pdb_chain]
+        elif cluster_id in test_ids:
+            if cluster_id in test.keys():
+                test[cluster_id].append(pdb_chain)
             else:
-                test[r[2]] = [r[:2]]
+                test[cluster_id] = [pdb_chain]
         else:
-            if r[2] in train.keys():
-                train[r[2]].append(r[:2])
+            if cluster_id in train.keys():
+                train[cluster_id].append(pdb_chain)
             else:
-                train[r[2]] = [r[:2]]
+                train[cluster_id] = [pdb_chain]
+
+    # Use training set as validation for debugging
     if debug:
         valid = train
     return train, valid, test
